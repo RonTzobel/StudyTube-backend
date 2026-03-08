@@ -1,0 +1,22 @@
+# --- Web framework ---
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+
+# --- Database ---
+sqlmodel==0.0.22          # SQLModel = SQLAlchemy + Pydantic in one
+psycopg2-binary==2.9.10   # PostgreSQL driver (binary = no C compiler needed)
+alembic==1.14.0           # Database migration tool (for future use)
+
+# --- Settings ---
+pydantic-settings==2.6.1  # Loads config from .env files
+
+# --- Auth (placeholders — will be used when auth is implemented) ---
+passlib[bcrypt]==1.7.4    # Password hashing
+python-jose[cryptography]==3.3.0  # JWT tokens
+
+# --- Validation ---
+email-validator==2.2.0    # Enables pydantic EmailStr validation
+
+# --- Testing ---
+pytest==8.3.4
+httpx==0.28.1             # Required by FastAPI's TestClient
