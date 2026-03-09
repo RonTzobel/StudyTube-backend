@@ -4,7 +4,7 @@ uvicorn[standard]==0.32.1
 
 # --- Database ---
 sqlmodel==0.0.22          # SQLModel = SQLAlchemy + Pydantic in one
-psycopg2-binary==2.9.10   # PostgreSQL driver (binary = no C compiler needed)
+psycopg[binary]==3.2.3    # PostgreSQL driver (v3, pre-built wheel, no pg_config needed)
 alembic==1.14.0           # Database migration tool (for future use)
 
 # --- Settings ---
@@ -16,6 +16,9 @@ python-jose[cryptography]==3.3.0  # JWT tokens
 
 # --- Validation ---
 email-validator==2.2.0    # Enables pydantic EmailStr validation
+
+# --- Transcription ---
+openai-whisper            # OpenAI Whisper speech-to-text (pins its own torch/numpy deps)
 
 # --- Testing ---
 pytest==8.3.4

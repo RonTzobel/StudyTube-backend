@@ -2,9 +2,16 @@ from sqlmodel import SQLModel, Session, create_engine
 
 from app.config.settings import settings
 
+# Use psycopg (v3) when URL is postgresql:// or postgres:// (psycopg2 often missing on Python 3.14).
+_url = settings.DATABASE_URL
+if _url.startswith("postgresql://") and "+" not in _url.split(":", 1)[0]:
+    _url = _url.replace("postgresql://", "postgresql+psycopg://", 1)
+elif _url.startswith("postgres://") and "+" not in _url.split(":", 1)[0]:
+    _url = _url.replace("postgres://", "postgresql+psycopg://", 1)
+
 # create_engine sets up the connection pool to PostgreSQL.
 # echo=True logs every SQL query — useful during development, turn off in production.
-engine = create_engine(settings.DATABASE_URL, echo=settings.DEBUG)
+engine = create_engine(_url, echo=settings.DEBUG)
 
 
 def create_db_and_tables() -> None:

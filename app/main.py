@@ -1,10 +1,35 @@
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from sqlmodel import Session
 
 from app.config.settings import settings
-from app.database.session import create_db_and_tables
+from app.database.session import create_db_and_tables, engine
+from app.models.user import User
 from app.routers import auth, health, videos
+
+
+def _seed_default_user() -> None:
+    """
+    Create a placeholder user with id=1 if one does not exist.
+
+    This is a TEMPORARY measure until JWT authentication is implemented.
+    All uploaded videos are currently assigned to this user (user_id=1).
+
+    Once real auth is in place:
+      - Remove this function.
+      - Replace the hardcoded user_id in the upload endpoint with the
+        user id extracted from the JWT token.
+    """
+    with Session(engine) as session:
+        if session.get(User, 1) is None:
+            placeholder = User(
+                email="default@studytube.dev",
+                username="default",
+                hashed_password="placeholder_not_a_real_password",
+            )
+            session.add(placeholder)
+            session.commit()
 
 
 @asynccontextmanager
@@ -12,10 +37,12 @@ async def lifespan(app: FastAPI):
     """
     Runs once at startup and once at shutdown.
 
-    Startup: create database tables if they don't exist yet.
-    This is fine for development. In production, use Alembic migrations.
+    Startup:
+      1. Create database tables (if they don't exist yet).
+      2. Seed the placeholder user so foreign keys work before auth is live.
     """
     create_db_and_tables()
+    _seed_default_user()
     yield
     # Shutdown logic can go here if needed (e.g. close connections)
 

@@ -55,24 +55,26 @@ backend/
 
 ## Prerequisites
 
-- Python 3.11+
+- **Python 3.14** (or 3.11+)
 - PostgreSQL running locally (or via Docker)
 
 ---
 
 ## Local Setup
 
+Run each command separately (one at a time).
+
 ### 1. Create and activate a virtual environment
 
 ```bash
 python -m venv venv
-
-# macOS / Linux
-source venv/bin/activate
-
-# Windows
-venv\Scripts\activate
 ```
+
+Then activate it:
+
+- **macOS / Linux:** `source venv/bin/activate`
+- **Windows (PowerShell):** `.\venv\Scripts\Activate.ps1`
+- **Windows (CMD):** `venv\Scripts\activate.bat`
 
 ### 2. Install dependencies
 
