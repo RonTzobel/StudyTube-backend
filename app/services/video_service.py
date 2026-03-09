@@ -51,6 +51,45 @@ def save_upload_file(upload_file: UploadFile, upload_dir: str) -> dict:
     }
 
 
+def create_video_from_upload(
+    session: Session,
+    title: str,
+    file_path: str,
+    user_id: int = 1,
+) -> Video:
+    """
+    Create a Video record in the database after a file has been saved to disk.
+
+    This is called by the upload endpoint once save_upload_file() succeeds.
+    It is intentionally separate from create_video() because the upload flow
+    receives a filename and a file path — not a VideoCreate schema.
+
+    Args:
+        session:   The database session injected by FastAPI.
+        title:     The video title — defaults to the original filename for now.
+        file_path: The path where the file was saved on disk.
+        user_id:   Hardcoded to 1 until JWT auth is implemented. Every upload
+                   is owned by the placeholder user created at startup.
+
+    Returns:
+        The newly created and database-refreshed Video object.
+    """
+    video = Video(
+        user_id=user_id,
+        title=title,
+        file_path=file_path,
+        status="uploaded",
+    )
+    # session.add() stages the object — it is not in the DB yet.
+    session.add(video)
+    # session.commit() writes the INSERT to PostgreSQL and assigns the id.
+    session.commit()
+    # session.refresh() re-reads the row so the returned object has
+    # the id and created_at values that PostgreSQL generated.
+    session.refresh(video)
+    return video
+
+
 def get_videos_for_user(session: Session, user_id: int) -> list[Video]:
     """Return all videos belonging to a specific user."""
     return list(session.exec(select(Video).where(Video.user_id == user_id)).all())
@@ -78,6 +117,21 @@ def create_video(session: Session, user_id: int, video_data: VideoCreate) -> Vid
     session.commit()
     session.refresh(video)
     return video
+
+
+def update_video_status(session: Session, video: Video, status: str) -> None:
+    """
+    Update the processing status of a video and commit immediately.
+
+    Valid status values (by convention): uploaded → processing → done → failed
+
+    This is called by the transcription endpoint to keep the video record
+    in sync with what is actually happening to the file.
+    """
+    video.status = status
+    session.add(video)
+    session.commit()
+    session.refresh(video)
 
 
 def delete_video(session: Session, video: Video) -> None:
