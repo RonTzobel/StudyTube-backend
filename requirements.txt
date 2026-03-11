@@ -20,6 +20,13 @@ email-validator==2.2.0    # Enables pydantic EmailStr validation
 # --- Transcription ---
 openai-whisper            # OpenAI Whisper speech-to-text (pins its own torch/numpy deps)
 
+# --- Embeddings ---
+sentence-transformers     # Local semantic embedding model (all-MiniLM-L6-v2 default)
+                          # Reuses torch already pulled in by openai-whisper
+
+# --- LLM / Answer generation ---
+openai>=1.0.0             # OpenAI Python SDK v1+ (used only for /ask endpoint)
+
 # --- Testing ---
 pytest==8.3.4
 httpx==0.28.1             # Required by FastAPI's TestClient
