@@ -1,13 +1,23 @@
 import os
 from pathlib import Path
+from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from sqlmodel import Session
 
 from app.config.settings import settings
 from app.database.session import get_session
+from app.schemas.chunk import ChunkRead
+from app.schemas.qa import AskRequest, AskResponse
+from app.schemas.retrieval import RetrievedChunkRead, SearchChunksRequest
+from app.schemas.summary import SummaryRead
 from app.schemas.transcript import TranscriptRead
 from app.schemas.video import VideoRead
+from app.services.summary_service import (
+    create_summary,
+    generate_summary,
+    get_summary_by_video_id,
+)
 from app.services.transcript_service import (
     create_transcript,
     extract_audio,
@@ -15,6 +25,15 @@ from app.services.transcript_service import (
     get_video_by_id,
     transcribe_audio,
 )
+from app.services.chunk_service import (
+    chunks_exist_for_video,
+    create_chunks,
+    get_chunks_by_video_id,
+    split_into_chunks,
+)
+from app.services.embedding_service import embed_all_chunks
+from app.services.qa_service import answer_question
+from app.services.retrieval_service import search_chunks
 from app.services.video_service import create_video_from_upload, save_upload_file, update_video_status
 
 # Allowed video MIME types.
@@ -205,6 +224,252 @@ def transcribe_video(
     transcript = create_transcript(session, video_id=video_id, content=text, source="whisper")
     update_video_status(session, video, "done")
     return transcript
+
+
+@router.post("/{video_id}/summarize", response_model=SummaryRead)
+def summarize_video(
+    video_id: int,
+    session: Session = Depends(get_session),
+):
+    """
+    Generate and save a summary for a video's transcript.
+
+    How it works:
+      1. Confirm the video exists.
+      2. Confirm a transcript exists — a summary cannot be created without one.
+      3. Return the existing summary if one already exists (idempotent).
+      4. Generate a summary from the transcript text.
+      5. Save the summary to the DB and return it.
+
+    To upgrade from local summarization to OpenAI later, only
+    summary_service.generate_summary() needs to change — nothing here.
+    """
+    # Step 1 — confirm the video exists
+    video = get_video_by_id(session, video_id)
+    if video is None:
+        raise HTTPException(status_code=404, detail=f"Video {video_id} not found.")
+
+    # Step 2 — confirm a transcript exists
+    transcript = get_transcript_by_video_id(session, video_id)
+    if transcript is None:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"No transcript found for video {video_id}. "
+                "Run POST /api/v1/videos/{video_id}/transcribe first."
+            ),
+        )
+
+    # Step 3 — idempotency: return existing summary without regenerating
+    existing = get_summary_by_video_id(session, video_id)
+    if existing is not None:
+        return existing
+
+    # Step 4 — generate the summary from the transcript text
+    summary_text = generate_summary(transcript.content or "")
+
+    # Step 5 — persist and return
+    return create_summary(session, video_id=video_id, content=summary_text, source="local")
+
+
+@router.post("/{video_id}/chunk", response_model=List[ChunkRead])
+def chunk_transcript(
+    video_id: int,
+    session: Session = Depends(get_session),
+):
+    """
+    Split a video's transcript into chunks and save them.
+
+    How it works:
+      1. Confirm the video exists.
+      2. Confirm a transcript exists — chunking requires text to split.
+      3. Return existing chunks immediately if already chunked (idempotent).
+      4. Split the transcript text into overlapping fixed-size chunks.
+      5. Save all chunks to the DB and return them.
+
+    Chunk settings (in chunk_service.py):
+      chunk_size = 500 characters
+      overlap    = 50 characters
+
+    These defaults work well for short-to-medium lecture segments.
+    Adjust them in split_into_chunks() when you add embeddings.
+    """
+    # Step 1 — confirm the video exists
+    video = get_video_by_id(session, video_id)
+    if video is None:
+        raise HTTPException(status_code=404, detail=f"Video {video_id} not found.")
+
+    # Step 2 — confirm a transcript exists
+    transcript = get_transcript_by_video_id(session, video_id)
+    if transcript is None:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"No transcript found for video {video_id}. "
+                "Run POST /api/v1/videos/{video_id}/transcribe first."
+            ),
+        )
+
+    # Step 3 — idempotency: return existing chunks without re-splitting
+    if chunks_exist_for_video(session, video_id):
+        return get_chunks_by_video_id(session, video_id)
+
+    # Step 4 — split the transcript into chunks
+    raw_chunks = split_into_chunks(transcript.content or "")
+
+    # Step 5 — persist and return
+    return create_chunks(session, video_id=video_id, chunks=raw_chunks)
+
+
+@router.get("/{video_id}/chunks", response_model=List[ChunkRead])
+def list_chunks(
+    video_id: int,
+    session: Session = Depends(get_session),
+):
+    """
+    Return all saved chunks for a video, ordered by chunk_index.
+
+    Raises 404 if the video does not exist.
+    Returns an empty list if the transcript has not been chunked yet
+    (call POST /{video_id}/chunk first).
+    """
+    video = get_video_by_id(session, video_id)
+    if video is None:
+        raise HTTPException(status_code=404, detail=f"Video {video_id} not found.")
+
+    return get_chunks_by_video_id(session, video_id)
+
+
+@router.post("/{video_id}/embed", response_model=List[ChunkRead])
+def embed_video_chunks(
+    video_id: int,
+    session: Session = Depends(get_session),
+):
+    """
+    Generate and save embeddings for all chunks of a video's transcript.
+
+    How it works:
+      1. Confirm the video exists.
+      2. Confirm chunks exist — embedding requires chunked text.
+      3. Embed every un-embedded chunk and persist the vectors.
+      4. Return all chunks (is_embedded=True once done).
+
+    Idempotent: chunks that already have is_embedded=True are skipped.
+    Safe to call multiple times — only pending chunks are processed.
+
+    Current embedding: 26-dimensional character-frequency placeholder.
+    To upgrade to real embeddings (e.g. OpenAI text-embedding-3-small),
+    replace embed_text() in embedding_service.py — nothing else changes.
+    """
+    # Step 1 — confirm the video exists
+    video = get_video_by_id(session, video_id)
+    if video is None:
+        raise HTTPException(status_code=404, detail=f"Video {video_id} not found.")
+
+    # Step 2 — confirm chunks exist
+    if not chunks_exist_for_video(session, video_id):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"No chunks found for video {video_id}. "
+                "Run POST /api/v1/videos/{video_id}/chunk first."
+            ),
+        )
+
+    # Step 3 & 4 — embed pending chunks and return all
+    return embed_all_chunks(session, video_id)
+
+
+@router.post("/{video_id}/search", response_model=List[RetrievedChunkRead])
+def search_video_chunks(
+    video_id: int,
+    request: SearchChunksRequest,
+    session: Session = Depends(get_session),
+):
+    """
+    Semantic search over a video's transcript chunks.
+
+    How it works:
+      1. Confirm the video exists.
+      2. Embed the query string using the same local model used for chunks.
+      3. Compute cosine similarity between the query and every embedded chunk.
+      4. Return the top_k most relevant chunks, highest similarity first.
+
+    Prerequisites:
+      - POST /{video_id}/transcribe must have been called first.
+      - POST /{video_id}/chunk must have been called first.
+      - POST /{video_id}/embed must have been called first.
+
+    Request body:
+      { "query": "מה הנושא הראשי?", "top_k": 5 }
+    """
+    # Step 1 — confirm the video exists
+    video = get_video_by_id(session, video_id)
+    if video is None:
+        raise HTTPException(status_code=404, detail=f"Video {video_id} not found.")
+
+    # Steps 2–4 — embed query, score chunks, return ranked results
+    try:
+        results = search_chunks(
+            session=session,
+            video_id=video_id,
+            query=request.query,
+            top_k=request.top_k,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    return results
+
+
+@router.post("/{video_id}/ask", response_model=AskResponse)
+def ask_question(
+    video_id: int,
+    request: AskRequest,
+    session: Session = Depends(get_session),
+):
+    """
+    Answer a question about a video using RAG (Retrieval-Augmented Generation).
+
+    How it works:
+      1. Confirm the video exists.
+      2. Retrieve the top_k most relevant transcript chunks for the question
+         (same cosine-similarity search as /search).
+      3. Inject those chunks as context into a prompt.
+      4. Send the prompt to OpenAI and return the grounded answer.
+
+    The answer is grounded in the transcript — the LLM is instructed to
+    answer ONLY from the provided chunks and say "I don't know" if the
+    answer isn't there. This prevents hallucination outside the video content.
+
+    Prerequisites:
+      - POST /{video_id}/transcribe must have been called.
+      - POST /{video_id}/chunk must have been called.
+      - POST /{video_id}/embed must have been called.
+      - OPENAI_API_KEY must be set in .env.
+
+    Request body example:
+      { "question": "What did the lecturer say about recursion?", "top_k": 3 }
+    """
+    # Step 1 — confirm the video exists
+    video = get_video_by_id(session, video_id)
+    if video is None:
+        raise HTTPException(status_code=404, detail=f"Video {video_id} not found.")
+
+    # Steps 2–4 — retrieve, build prompt, generate answer
+    try:
+        return answer_question(
+            session=session,
+            video_id=video_id,
+            question=request.question,
+            top_k=request.top_k,
+        )
+    except ValueError as exc:
+        # No embedded chunks exist yet
+        raise HTTPException(status_code=422, detail=str(exc))
+    except RuntimeError as exc:
+        # openai not installed or API key missing
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @router.get("/")

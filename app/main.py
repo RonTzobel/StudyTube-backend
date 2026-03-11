@@ -5,6 +5,8 @@ from sqlmodel import Session
 
 from app.config.settings import settings
 from app.database.session import create_db_and_tables, engine
+from app.models.chunk import TranscriptChunk  # noqa: F401 — registers table with SQLModel
+from app.models.summary import Summary  # noqa: F401 — registers table with SQLModel
 from app.models.user import User
 from app.routers import auth, health, videos
 
