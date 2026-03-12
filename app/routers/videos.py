@@ -9,6 +9,7 @@ from app.config.settings import settings
 from app.database.session import get_session
 from app.schemas.chunk import ChunkRead
 from app.schemas.qa import AskRequest, AskResponse
+from app.schemas.quiz import QuizRequest, QuizResponse
 from app.schemas.retrieval import RetrievedChunkRead, SearchChunksRequest
 from app.schemas.summary import SummaryRead
 from app.schemas.transcript import TranscriptRead
@@ -33,6 +34,7 @@ from app.services.chunk_service import (
 )
 from app.services.embedding_service import embed_all_chunks
 from app.services.qa_service import answer_question
+from app.services.quiz_service import generate_quiz
 from app.services.retrieval_service import search_chunks
 from app.services.video_service import create_video_from_upload, save_upload_file, update_video_status
 
@@ -466,6 +468,68 @@ def ask_question(
         )
     except ValueError as exc:
         # No embedded chunks exist yet
+        raise HTTPException(status_code=422, detail=str(exc))
+    except RuntimeError as exc:
+        # openai not installed or API key missing
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.post("/{video_id}/quiz", response_model=QuizResponse)
+def generate_video_quiz(
+    video_id: int,
+    request: QuizRequest,
+    session: Session = Depends(get_session),
+):
+    """
+    Generate multiple-choice quiz questions grounded in a video's transcript.
+
+    How it works:
+      1. Confirm the video exists.
+      2. Confirm embedded chunks exist — quiz generation requires embedded text.
+      3. Sample transcript chunks evenly across the video for broad coverage.
+      4. Send those chunks to OpenAI and ask for multiple-choice questions.
+      5. Parse the JSON response and return structured quiz questions.
+
+    Prerequisites:
+      - POST /{video_id}/transcribe must have been called.
+      - POST /{video_id}/chunk must have been called.
+      - POST /{video_id}/embed must have been called.
+      - OPENAI_API_KEY must be set in .env.
+
+    Request body example:
+      { "num_questions": 5, "top_k": 10 }
+
+    Each question includes:
+      - question text
+      - 4 answer options (A, B, C, D)
+      - the correct answer
+    """
+    # Step 1 — confirm the video exists
+    video = get_video_by_id(session, video_id)
+    if video is None:
+        raise HTTPException(status_code=404, detail=f"Video {video_id} not found.")
+
+    # Step 2 — confirm chunks exist (quiz_service will check for embeddings)
+    if not chunks_exist_for_video(session, video_id):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"No chunks found for video {video_id}. "
+                "Run POST /api/v1/videos/{video_id}/chunk then "
+                "POST /api/v1/videos/{video_id}/embed first."
+            ),
+        )
+
+    # Steps 3–5 — sample chunks, call OpenAI, parse and return
+    try:
+        return generate_quiz(
+            session=session,
+            video_id=video_id,
+            num_questions=request.num_questions,
+            top_k=request.top_k,
+        )
+    except ValueError as exc:
+        # No embedded chunks, or OpenAI returned malformed JSON
         raise HTTPException(status_code=422, detail=str(exc))
     except RuntimeError as exc:
         # openai not installed or API key missing

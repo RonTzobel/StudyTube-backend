@@ -26,13 +26,25 @@ class AskResponse(BaseModel):
 
     Fields:
         question:          The original question echoed back.
-        answer:            The LLM's answer, grounded in the retrieved chunks.
+        answer:            The LLM's answer, or a fallback message if the
+                           transcript evidence was too weak.
         top_k:             How many chunks were used as context.
-        retrieved_chunks:  The chunks that were passed to the LLM — useful for
-                           debugging or showing the user where the answer came from.
+        grounded:          True  → OpenAI was called with retrieved chunks.
+                           False → similarity was below RAG_LOW_THRESHOLD;
+                                   OpenAI was NOT called.
+        confidence_level:  "high" → best chunk score ≥ RAG_GOOD_THRESHOLD.
+                           "low"  → score between RAG_LOW_THRESHOLD and
+                                    RAG_GOOD_THRESHOLD (OpenAI still called,
+                                    but retrieval was borderline).
+                           "none" → score below RAG_LOW_THRESHOLD; fallback
+                                    returned without calling OpenAI.
+        retrieved_chunks:  The chunks scored during retrieval (always present
+                           so the caller can inspect scores).
     """
 
     question: str
     answer: str
     top_k: int
+    grounded: bool
+    confidence_level: str  # "high" | "low" | "none"
     retrieved_chunks: List[RetrievedChunkRead]
