@@ -95,6 +95,12 @@ _SYSTEM_MESSAGE = (
 # Main QA function
 # ---------------------------------------------------------------------------
 
+_FALLBACK_ANSWER = (
+    "I could not find enough relevant information in this video to answer confidently. "
+    "Try rephrasing your question or asking about a topic that is covered in the transcript."
+)
+
+
 def answer_question(
     session,
     video_id: int,
@@ -105,43 +111,81 @@ def answer_question(
     """
     Full RAG pipeline: retrieve relevant chunks, then generate an answer.
 
-    Steps:
-      1. Retrieve the top_k most semantically relevant transcript chunks
-         for the question (reuses the existing retrieval_service).
-      2. Build a prompt that injects those chunks as context.
-      3. Send the prompt to OpenAI and return the grounded answer.
+    Two-level confidence policy (calibrated for all-MiniLM-L6-v2 on Hebrew):
+      - best_score < RAG_LOW_THRESHOLD   → immediate fallback, no OpenAI call.
+      - RAG_LOW_THRESHOLD ≤ score
+              < RAG_GOOD_THRESHOLD       → call OpenAI with the same strict
+                                           grounded prompt; mark as "low" confidence.
+      - best_score ≥ RAG_GOOD_THRESHOLD  → normal grounded flow, "high" confidence.
 
-    This is what makes it RAG (Retrieval-Augmented Generation):
-      - Pure LLM: answers from training data → may hallucinate.
-      - RAG: answers from YOUR retrieved content → grounded in the transcript.
+    Why two levels?
+    all-MiniLM-L6-v2 is English-trained. For Hebrew content it still produces
+    meaningful vectors, but scores are systematically 30–50 % lower than for
+    English queries. A score of ~0.20 on Hebrew is equivalent to ~0.35 on
+    English — genuinely relevant, worth sending to the LLM.
 
     Args:
         session:   DB session injected by FastAPI.
         video_id:  The video to answer questions about.
         question:  The user's natural-language question.
         top_k:     Number of chunks to retrieve as context.
-        model:     OpenAI model to use. gpt-4o-mini is fast and cheap;
-                   swap to gpt-4o for higher quality if needed.
+        model:     OpenAI model to use. gpt-4o-mini is fast and cheap.
 
     Returns:
-        AskResponse with the answer and the retrieved chunks.
+        AskResponse with the answer, grounded flag, confidence_level, and chunks.
 
     Raises:
-        ValueError:   If no embedded chunks exist for this video (from search_chunks).
+        ValueError:   If no embedded chunks exist for this video.
         RuntimeError: If openai is not installed or OPENAI_API_KEY is missing.
     """
-    # Step 1 — retrieve relevant chunks using the existing retrieval service
+    # Step 1 — retrieve relevant chunks using the existing retrieval service.
+    # We always fetch top_k + 2 so we have spare chunks available for the
+    # borderline zone (see Step 2 below). The tiny extra retrieval cost is
+    # worth the improved context coverage for weak-match questions.
     chunks: List[RetrievedChunkRead] = search_chunks(
         session=session,
         video_id=video_id,
         query=question,
-        top_k=top_k,
+        top_k=top_k + 2,
     )
 
-    # Step 2 — build the prompt
-    user_message = _build_prompt(question, chunks)
+    # Step 2 — two-level quality gate.
+    # chunks are returned highest-similarity-first, so index 0 is the best.
+    best_score = chunks[0].similarity_score if chunks else 0.0
 
-    # Step 3 — call OpenAI
+    # Below the absolute floor → content is almost certainly off-topic.
+    # Save the API token; return fallback immediately.
+    if best_score < settings.RAG_LOW_THRESHOLD:
+        return AskResponse(
+            question=question,
+            answer=_FALLBACK_ANSWER,
+            top_k=top_k,
+            grounded=False,
+            confidence_level="none",
+            retrieved_chunks=chunks,
+        )
+
+    # Determine confidence level before calling OpenAI.
+    # This is passed through to the response so callers can decide how much
+    # to trust the answer (e.g. show a "low confidence" badge in the UI).
+    confidence_level = (
+        "high" if best_score >= settings.RAG_GOOD_THRESHOLD else "low"
+    )
+
+    # In the borderline zone individual chunks are weakly relevant, so we
+    # send all top_k+2 chunks to give the LLM a wider window to find the
+    # answer. In the high-confidence zone trim back to the requested top_k —
+    # those chunks are already high-quality and we don't need extras.
+    context_chunks = chunks if confidence_level == "low" else chunks[:top_k]
+
+    # Step 3 — build the prompt
+    user_message = _build_prompt(question, context_chunks)
+
+    # Step 4 — call OpenAI.
+    # We use the same strict grounded system message for BOTH confidence
+    # levels. The LLM is already instructed to say "I don't know" if the
+    # context doesn't contain the answer, so the borderline ("low") case is
+    # safe: if the chunks are genuinely irrelevant, the LLM will say so.
     client = _get_openai_client()
     response = client.chat.completions.create(
         model=model,
@@ -158,6 +202,8 @@ def answer_question(
     return AskResponse(
         question=question,
         answer=answer,
-        top_k=top_k,
-        retrieved_chunks=chunks,
+        top_k=len(context_chunks),   # reflect actual chunks sent to the LLM
+        grounded=True,
+        confidence_level=confidence_level,
+        retrieved_chunks=context_chunks,
     )
