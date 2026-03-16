@@ -36,7 +36,7 @@ from app.services.embedding_service import embed_all_chunks
 from app.services.qa_service import answer_question
 from app.services.quiz_service import generate_quiz
 from app.services.retrieval_service import search_chunks
-from app.services.video_service import create_video_from_upload, save_upload_file, update_video_status
+from app.services.video_service import create_video_from_upload, get_videos_for_user, save_upload_file, update_video_status
 
 # Allowed video MIME types.
 # This is a basic whitelist — we reject anything that doesn't look like a video.
@@ -536,7 +536,9 @@ def generate_video_quiz(
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-@router.get("/")
-def list_videos_placeholder():
-    """Placeholder — will list the current user's videos once auth is in place."""
-    return {"message": "Videos router is ready. Implementation coming soon."}
+@router.get("/", response_model=List[VideoRead])
+def list_videos(
+    session: Session = Depends(get_session),
+):
+    """Return all videos for user_id=1 (hardcoded until auth is implemented)."""
+    return get_videos_for_user(session, user_id=1)

@@ -1,4 +1,10 @@
+from pathlib import Path
 from pydantic_settings import BaseSettings
+
+# Resolve the .env file relative to this file's location so the path is
+# always correct regardless of the working directory at launch time.
+# settings.py → app/config/   parent → app/   parent → backend/  ← .env lives here
+_ENV_FILE = Path(__file__).resolve().parent.parent.parent / ".env"
 
 
 class Settings(BaseSettings):
@@ -55,13 +61,19 @@ class Settings(BaseSettings):
     RAG_LOW_THRESHOLD: float = 0.10
     RAG_GOOD_THRESHOLD: float = 0.22
 
+    # --- Whisper transcription ---
+    # Model size: "medium" is recommended for Hebrew (small/base degrade noticeably).
+    # device="cpu" and compute_type="int8" are safe defaults for Windows / no-GPU setups.
+    WHISPER_MODEL: str = "medium"
+    WHISPER_DEVICE: str = "cpu"
+    WHISPER_COMPUTE_TYPE: str = "int8"
+
     # --- Security (placeholder for future JWT auth) ---
     SECRET_KEY: str = "changeme"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
 
     class Config:
-        # Tells pydantic-settings to look for a .env file
-        env_file = ".env"
+        env_file = str(_ENV_FILE)
         env_file_encoding = "utf-8"
 
 

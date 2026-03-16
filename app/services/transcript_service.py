@@ -4,6 +4,7 @@ import tempfile
 
 from sqlmodel import Session, select
 
+from app.config.settings import settings
 from app.models.transcript import Transcript
 from app.models.video import Video
 
@@ -97,29 +98,33 @@ def extract_audio(video_path: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Whisper transcription
+# Whisper transcription  (faster-whisper)
 # ---------------------------------------------------------------------------
 
 # Model is loaded once at module import time to avoid the multi-second
-# reload penalty on every transcription request. "medium" is chosen because
-# Hebrew is under-represented in Whisper's training data and smaller models
-# produce noticeably degraded output. fp16=False is required on CPU (Windows).
-_WHISPER_MODEL_NAME = "medium"
-
+# reload penalty on every transcription request.
+# device="cpu" + compute_type="int8" are safe defaults for Windows / no-GPU setups.
 try:
-    import whisper as _whisper
-    _whisper_model = _whisper.load_model(_WHISPER_MODEL_NAME)
-except Exception:  # whisper not installed — server still starts
+    from faster_whisper import WhisperModel as _WhisperModel
+    _whisper_model = _WhisperModel(
+        settings.WHISPER_MODEL,
+        device=settings.WHISPER_DEVICE,
+        compute_type=settings.WHISPER_COMPUTE_TYPE,
+    )
+except Exception:  # faster-whisper not installed — server still starts
     _whisper_model = None
 
 
 def transcribe_audio(audio_path: str) -> str:
     """
-    Transcribe an audio file using OpenAI Whisper (Hebrew only).
+    Transcribe an audio file using faster-whisper (Hebrew only).
 
     The model is loaded once at module level (_whisper_model) and reused
     across calls. language="he" and task="transcribe" are fixed to prevent
     auto-detection from switching to the wrong language.
+
+    faster-whisper returns a generator of segments; we join them into a
+    single string to match the previous openai-whisper behavior.
 
     Args:
         audio_path:  Path to a WAV file produced by extract_audio().
@@ -129,15 +134,20 @@ def transcribe_audio(audio_path: str) -> str:
         whitespace stripped.
 
     Raises:
-        RuntimeError: If the whisper package is not installed.
+        RuntimeError: If faster-whisper is not installed.
     """
     if _whisper_model is None:
         raise RuntimeError(
-            "openai-whisper is not installed. Run: pip install openai-whisper"
+            "faster-whisper is not installed. Run: pip install faster-whisper"
         )
 
-    result = _whisper_model.transcribe(audio_path, language="he", task="transcribe", fp16=False)
-    return result["text"].strip()
+    # segments is a generator — consume it once to build the full text.
+    segments, _info = _whisper_model.transcribe(
+        audio_path,
+        language="he",
+        task="transcribe",
+    )
+    return " ".join(seg.text.strip() for seg in segments).strip()
 
 
 # ---------------------------------------------------------------------------

@@ -8,8 +8,9 @@ from app.config.settings import settings
 from app.database.session import create_db_and_tables, engine
 from app.models.chunk import TranscriptChunk  # noqa: F401 — registers table with SQLModel
 from app.models.summary import Summary  # noqa: F401 — registers table with SQLModel
+from app.models.chat import ChatSession, ChatMessage  # noqa: F401 — registers tables with SQLModel
 from app.models.user import User
-from app.routers import auth, health, videos
+from app.routers import auth, chat, health, tutor, videos
 
 
 def _seed_default_user() -> None:
@@ -75,6 +76,8 @@ app.add_middleware(
 app.include_router(health.router)
 app.include_router(auth.router, prefix="/api/v1")
 app.include_router(videos.router, prefix="/api/v1")
+app.include_router(tutor.router, prefix="/api/v1")
+app.include_router(chat.router, prefix="/api/v1")
 
 
 @app.get("/")

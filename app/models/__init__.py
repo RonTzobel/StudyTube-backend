@@ -7,3 +7,4 @@
 # can see them and create their tables on startup.
 from app.models.chunk import TranscriptChunk  # noqa: F401
 from app.models.summary import Summary  # noqa: F401
+from app.models.chat import ChatSession, ChatMessage  # noqa: F401

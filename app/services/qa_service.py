@@ -1,3 +1,5 @@
+import logging
+import time
 from typing import List
 
 from sqlmodel import Session
@@ -6,6 +8,8 @@ from app.config.settings import settings
 from app.schemas.qa import AskResponse
 from app.schemas.retrieval import RetrievedChunkRead
 from app.services.retrieval_service import search_chunks
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +105,163 @@ _FALLBACK_ANSWER = (
 )
 
 
+# ---------------------------------------------------------------------------
+# General-knowledge fallback
+#
+# Used only when the lecture retrieval score is below RAG_LOW_THRESHOLD,
+# meaning the transcript almost certainly does not cover the question.
+# In that case, instead of returning the static fallback string, we call
+# OpenAI in a general-assistant mode so the student still gets a useful answer.
+#
+# This is intentionally a separate prompt and separate function from the
+# grounded lecture flow — the two modes must never be mixed.
+# ---------------------------------------------------------------------------
+
+_GENERAL_SYSTEM_MESSAGE = (
+    "You are a helpful AI study assistant. "
+    "Answer the student's question using your general knowledge. "
+    "Be clear, concise, and educational. "
+    "Answer in the same language as the question."
+)
+
+
+def _general_answer(question: str, model: str = "gpt-4o-mini") -> str:
+    """
+    Answer a question from general knowledge, with no transcript context.
+
+    Called when the lecture retrieval score is below RAG_LOW_THRESHOLD,
+    meaning the transcript does not cover the question at all.
+
+    Args:
+        question: The student's question.
+        model:    OpenAI model to use.
+
+    Returns:
+        The model's answer as a plain string.
+
+    Raises:
+        RuntimeError: If openai is not installed or OPENAI_API_KEY is missing.
+    """
+    client = _get_openai_client()
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": _GENERAL_SYSTEM_MESSAGE},
+            {"role": "user",   "content": question},
+        ],
+        temperature=0.5,   # slightly higher than lecture mode — general answers are more open-ended
+        max_tokens=1024,
+    )
+    return response.choices[0].message.content.strip()
+
+
+# The exact phrase the strict system prompt instructs the LLM to use when it
+# cannot find the answer in the provided transcript excerpts.
+# Used to detect the "OpenAI was called but couldn't answer from the lecture"
+# case — which must also fall back to general knowledge.
+_LECTURE_NOT_FOUND_PHRASE = "I could not find the answer to that question in this video."
+
+
+def answer_for_mode(
+    session,
+    video_id: int,
+    question: str,
+    question_mode: str,
+    top_k: int = 3,
+    model: str = "gpt-4o-mini",
+) -> tuple[str, str]:
+    """
+    Route a chat question to the correct answer pipeline based on the
+    explicit mode chosen by the user.
+
+    question_mode = "lecture"
+        Strict RAG flow using the video transcript. The LLM will say it
+        cannot find the answer if the content is not covered. No automatic
+        fallback to general knowledge — the user asked for lecture mode.
+
+    question_mode = "general"
+        Skip transcript retrieval entirely. Call OpenAI in general-knowledge
+        mode directly, same as _general_answer().
+
+    Returns:
+        (answer_text, answer_source) where answer_source is "lecture" or "general".
+
+    Raises:
+        ValueError:   If no embedded chunks exist for this video (lecture mode only).
+        RuntimeError: If openai is not installed or OPENAI_API_KEY is missing.
+    """
+    if question_mode == "general":
+        logger.info(
+            "answer_for_mode | general  video_id=%d  question=%r",
+            video_id, question[:80],
+        )
+        return _general_answer(question, model), "general"
+
+    # "lecture" — strict grounded flow, no fallback
+    logger.info(
+        "answer_for_mode | lecture  video_id=%d  question=%r",
+        video_id, question[:80],
+    )
+    rag_result = answer_question(session, video_id, question, top_k, model)
+    return rag_result.answer, "lecture"
+
+
+def answer_question_with_fallback(
+    session,
+    video_id: int,
+    question: str,
+    top_k: int = 3,
+    model: str = "gpt-4o-mini",
+) -> tuple[str, str]:
+    """
+    Lecture-first, general-fallback answer pipeline.
+
+    The general fallback triggers in TWO situations:
+      1. confidence_level == "none": score below RAG_LOW_THRESHOLD — no chunks
+         were relevant enough to send to OpenAI at all.
+      2. confidence_level == "low" or "high" BUT the LLM answered with the
+         "I could not find the answer" phrase — meaning chunks were found but
+         were genuinely off-topic (e.g. a borderline similarity score caused by
+         language mismatch on an unrelated question).
+
+    In all other cases the grounded lecture answer is returned as-is.
+
+    Args:
+        session:   DB session.
+        video_id:  The video to query.
+        question:  The student's question.
+        top_k:     Number of chunks to retrieve as context.
+        model:     OpenAI model to use.
+
+    Returns:
+        (answer_text, answer_source) where answer_source is "lecture" or "general".
+
+    Raises:
+        ValueError:   If no embedded chunks exist for this video (from answer_question).
+        RuntimeError: If openai is not installed or OPENAI_API_KEY is missing.
+    """
+    rag_result = answer_question(session, video_id, question, top_k, model)
+
+    if (
+        rag_result.confidence_level != "none"
+        and _LECTURE_NOT_FOUND_PHRASE not in rag_result.answer
+    ):
+        # Grounded answer: OpenAI was called with transcript chunks AND gave a
+        # real answer. The lecture is the source of truth.
+        return rag_result.answer, "lecture"
+
+    # Fall through to general AI in two cases:
+    #   - confidence_level == "none": no relevant chunks, OpenAI was not called.
+    #   - OpenAI was called but explicitly said it couldn't find the answer
+    #     (the LLM returned _LECTURE_NOT_FOUND_PHRASE).
+    logger.info(
+        "fallback | video_id=%d  confidence=%s  triggering general answer  question=%r",
+        video_id, rag_result.confidence_level, question[:80],
+    )
+    general_text = _general_answer(question, model)
+    return general_text, "general"
+
+
 def answer_question(
     session,
     video_id: int,
@@ -138,6 +299,10 @@ def answer_question(
         ValueError:   If no embedded chunks exist for this video.
         RuntimeError: If openai is not installed or OPENAI_API_KEY is missing.
     """
+    t_start = time.perf_counter()
+    question_preview = question[:80] + ("…" if len(question) > 80 else "")
+    logger.info("ask | start  video_id=%d  top_k=%d  question=%r", video_id, top_k, question_preview)
+
     # Step 1 — retrieve relevant chunks using the existing retrieval service.
     # We always fetch top_k + 2 so we have spare chunks available for the
     # borderline zone (see Step 2 below). The tiny extra retrieval cost is
@@ -152,10 +317,18 @@ def answer_question(
     # Step 2 — two-level quality gate.
     # chunks are returned highest-similarity-first, so index 0 is the best.
     best_score = chunks[0].similarity_score if chunks else 0.0
+    top_scores = [round(c.similarity_score, 3) for c in chunks[:5]]
+    logger.info("ask | retrieval  chunks=%d  best_score=%.3f  top_scores=%s", len(chunks), best_score, top_scores)
 
     # Below the absolute floor → content is almost certainly off-topic.
     # Save the API token; return fallback immediately.
     if best_score < settings.RAG_LOW_THRESHOLD:
+        elapsed_ms = int((time.perf_counter() - t_start) * 1000)
+        logger.info(
+            "ask | gate  confidence=none  openai_called=false  elapsed_ms=%d  "
+            "(best_score=%.3f below low_threshold=%.2f)",
+            elapsed_ms, best_score, settings.RAG_LOW_THRESHOLD,
+        )
         return AskResponse(
             question=question,
             answer=_FALLBACK_ANSWER,
@@ -178,6 +351,13 @@ def answer_question(
     # those chunks are already high-quality and we don't need extras.
     context_chunks = chunks if confidence_level == "low" else chunks[:top_k]
 
+    context_chars = sum(len(c.content) for c in context_chunks)
+    logger.info(
+        "ask | gate  confidence=%s  openai_called=true  "
+        "chunks_sent=%d  context_chars=%d",
+        confidence_level, len(context_chunks), context_chars,
+    )
+
     # Step 3 — build the prompt
     user_message = _build_prompt(question, context_chunks)
 
@@ -198,6 +378,12 @@ def answer_question(
     )
 
     answer = response.choices[0].message.content.strip()
+
+    elapsed_ms = int((time.perf_counter() - t_start) * 1000)
+    logger.info(
+        "ask | done  grounded=true  confidence=%s  answer_chars=%d  elapsed_ms=%d",
+        confidence_level, len(answer), elapsed_ms,
+    )
 
     return AskResponse(
         question=question,
