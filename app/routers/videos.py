@@ -1,3 +1,15 @@
+"""
+videos.py — Video management router.
+
+All endpoints require a valid Bearer JWT.
+Ownership is enforced on every video-scoped operation using _get_owned_video().
+
+Ownership rules:
+  - 401 : missing or invalid token (enforced by get_current_user dependency)
+  - 404 : resource does not exist
+  - 403 : resource exists but belongs to a different user
+"""
+
 import os
 from pathlib import Path
 from typing import List
@@ -6,7 +18,10 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from sqlmodel import Session
 
 from app.config.settings import settings
+from app.core.dependencies import get_current_user
 from app.database.session import get_session
+from app.models.user import User
+from app.models.video import Video
 from app.schemas.chunk import ChunkRead
 from app.schemas.qa import AskRequest, AskResponse
 from app.schemas.quiz import QuizRequest, QuizResponse
@@ -36,10 +51,15 @@ from app.services.embedding_service import embed_all_chunks
 from app.services.qa_service import answer_question
 from app.services.quiz_service import generate_quiz
 from app.services.retrieval_service import search_chunks
-from app.services.video_service import create_video_from_upload, get_videos_for_user, save_upload_file, update_video_status
+from app.services.video_service import (
+    create_video_from_upload,
+    delete_video,
+    get_videos_for_user,
+    save_upload_file,
+    update_video_status,
+)
 
-# Allowed video MIME types.
-# This is a basic whitelist — we reject anything that doesn't look like a video.
+# Allowed video MIME types — reject anything not in this whitelist.
 ALLOWED_CONTENT_TYPES = {
     "video/mp4",
     "video/webm",
@@ -48,34 +68,57 @@ ALLOWED_CONTENT_TYPES = {
     "video/x-msvideo",  # .avi
 }
 
-# 500 MB limit — prevents the server from being overwhelmed by huge files.
+# 500 MB hard limit.
 MAX_FILE_SIZE_BYTES = 500 * 1024 * 1024
 
 router = APIRouter(prefix="/videos", tags=["Videos"])
 
 
+# ---------------------------------------------------------------------------
+# Private ownership helper
+# ---------------------------------------------------------------------------
+
+def _get_owned_video(session: Session, video_id: int, user_id: int) -> Video:
+    """
+    Fetch a video and verify the requesting user owns it.
+
+    Raises:
+        404 if the video does not exist.
+        403 if the video exists but belongs to a different user.
+
+    Using 403 (not 404) for the ownership failure case is intentional:
+    it tells the client "you are authenticated but this resource is not yours",
+    which is more honest than pretending it doesn't exist once the user is
+    already logged in. If you prefer to hide existence entirely, swap to 404.
+    """
+    video = get_video_by_id(session, video_id)
+    if video is None:
+        raise HTTPException(status_code=404, detail=f"Video {video_id} not found.")
+    if video.user_id != user_id:
+        raise HTTPException(
+            status_code=403,
+            detail="You do not have permission to access this video.",
+        )
+    return video
+
+
+# ---------------------------------------------------------------------------
+# Upload
+# ---------------------------------------------------------------------------
+
 @router.post("/upload", response_model=VideoRead)
 def upload_video(
     file: UploadFile = File(...),
     session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
 ):
     """
-    Accept a video file, save it to disk, and create a Video record in the DB.
+    Accept a video file, save it to disk, and create an owned Video record.
 
-    How it works:
-      1. Validate the file's MIME type (must be a video format we support).
-      2. Validate the file size (must not exceed MAX_FILE_SIZE_BYTES).
-      3. Save the file to the uploads folder (via the service layer).
-      4. Create a Video record in the database (via the service layer).
-      5. Return the saved Video record as JSON.
-
-    The 'session' parameter is injected automatically by FastAPI using
-    Depends(get_session). The router never creates a session directly.
-
-    The 'response_model=VideoRead' tells FastAPI to serialize the returned
-    Video object using the VideoRead schema — this also drives the Swagger docs.
+    Ownership is derived exclusively from the authenticated JWT — the request
+    body never contains a user_id.
     """
-    # Step 1 — validate the MIME type
+    # Validate MIME type
     if file.content_type not in ALLOWED_CONTENT_TYPES:
         raise HTTPException(
             status_code=400,
@@ -85,10 +128,10 @@ def upload_video(
             ),
         )
 
-    # Step 2 — validate the file size using seek/tell (no memory cost)
-    file.file.seek(0, 2)          # jump to end
-    file_size = file.file.tell()  # position at end = total bytes
-    file.file.seek(0)             # rewind before saving
+    # Validate file size without loading it into memory
+    file.file.seek(0, 2)
+    file_size = file.file.tell()
+    file.file.seek(0)
 
     if file_size > MAX_FILE_SIZE_BYTES:
         raise HTTPException(
@@ -96,111 +139,84 @@ def upload_video(
             detail="File too large. Maximum allowed size is 500 MB.",
         )
 
-    # Step 3 — save the file to disk
-    result = save_upload_file(
-        upload_file=file,
-        upload_dir=settings.UPLOAD_DIR,
-    )
+    # Save file to disk
+    result = save_upload_file(upload_file=file, upload_dir=settings.UPLOAD_DIR)
 
-    # Step 4 — create a Video record in the database
-    # The title defaults to the original filename until the user can edit it.
-    # user_id=1 is hardcoded — will come from JWT token once auth is implemented.
+    # Create DB record — ownership comes from the token, never from the request
     video = create_video_from_upload(
         session=session,
         title=file.filename or "untitled",
         file_path=result["file_path"],
+        user_id=current_user.id,          # ← JWT identity, not request body
     )
-
-    # Step 5 — return the saved Video object
-    # FastAPI will serialize it using the VideoRead schema (see response_model above).
     return video
 
+
+# ---------------------------------------------------------------------------
+# List
+# ---------------------------------------------------------------------------
+
+@router.get("/", response_model=List[VideoRead])
+def list_videos(
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Return all videos belonging to the authenticated user.
+
+    Only the caller's own videos are returned — no user_id filter from
+    the frontend is read or trusted.
+    """
+    return get_videos_for_user(session, user_id=current_user.id)
+
+
+# ---------------------------------------------------------------------------
+# Transcript — read
+# ---------------------------------------------------------------------------
 
 @router.get("/{video_id}/transcript", response_model=TranscriptRead)
 def get_transcript(
     video_id: int,
     session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
 ):
-    """
-    Return the transcript for a given video.
+    """Return the transcript for a video the caller owns."""
+    _get_owned_video(session, video_id, current_user.id)  # ownership gate
 
-    Raises 404 if the video does not exist.
-    Raises 404 if the video exists but has no transcript yet.
-
-    The two checks are intentionally separate so the error message tells
-    the client exactly what is missing.
-    """
-    # Step 1 — confirm the video exists
-    # We check this first so the client gets a clear "video not found" message
-    # rather than a confusing "transcript not found" for a non-existent video.
-    video = get_video_by_id(session, video_id)
-    if video is None:
-        raise HTTPException(status_code=404, detail=f"Video {video_id} not found.")
-
-    # Step 2 — fetch the transcript
     transcript = get_transcript_by_video_id(session, video_id)
     if transcript is None:
         raise HTTPException(
             status_code=404,
             detail=f"No transcript found for video {video_id}. "
-                   "Transcription has not been run yet.",
+                   "Run POST /transcribe first.",
         )
-
-    # Step 3 — return the transcript
-    # FastAPI serializes it using TranscriptRead (see response_model above).
     return transcript
 
+
+# ---------------------------------------------------------------------------
+# Transcribe
+# ---------------------------------------------------------------------------
 
 @router.post("/{video_id}/transcribe", response_model=TranscriptRead)
 def transcribe_video(
     video_id: int,
     session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
 ):
-    """
-    Trigger Whisper transcription for an already-uploaded video.
-
-    How it works:
-      1. Confirm the video exists and its file is present on disk.
-      2. Return the existing transcript immediately if one already exists
-         (idempotent — safe to call more than once).
-      3. Mark the video as "processing" so callers know work is in progress.
-      4. Extract audio from the video file using ffmpeg (temp WAV, 16 kHz mono).
-      5. Transcribe the audio with OpenAI Whisper.
-      6. Save the transcript to the DB and mark the video "done".
-      7. Clean up the temp audio file regardless of success or failure.
-
-    This endpoint is synchronous — the request blocks until transcription
-    finishes. For long videos this can take minutes on CPU. A background
-    task queue (Celery / ARQ) is the right fix, but is out of scope for now.
-
-    Prerequisites (must be installed before calling this endpoint):
-      - ffmpeg must be on your PATH  (see README for install instructions)
-      - pip install openai-whisper   (or it's in requirements.txt)
-    """
-    # Step 1 — confirm the video exists and has a file on disk
-    video = get_video_by_id(session, video_id)
-    if video is None:
-        raise HTTPException(status_code=404, detail=f"Video {video_id} not found.")
+    """Trigger Whisper transcription for an owned video."""
+    video = _get_owned_video(session, video_id, current_user.id)  # ownership gate
 
     if not video.file_path or not Path(video.file_path).exists():
         raise HTTPException(
             status_code=422,
-            detail=(
-                f"Video {video_id} has no file on disk. "
-                "Upload the file first via POST /api/v1/videos/upload."
-            ),
+            detail=f"Video {video_id} has no file on disk. Upload the file first.",
         )
 
-    # Step 2 — idempotency: return existing transcript without re-running Whisper
     existing = get_transcript_by_video_id(session, video_id)
     if existing is not None:
-        return existing
+        return existing  # idempotent
 
-    # Step 3 — mark as processing before the slow work starts
     update_video_status(session, video, "processing")
-
-    # Steps 4 & 5 — extract audio then transcribe
-    # We keep audio_path in a variable so the finally block can always clean up.
     audio_path = None
     try:
         audio_path = extract_audio(video.file_path)
@@ -209,210 +225,127 @@ def transcribe_video(
         update_video_status(session, video, "failed")
         raise HTTPException(
             status_code=500,
-            detail=(
-                "ffmpeg was not found. "
-                "Install ffmpeg and make sure it is on your system PATH."
-            ),
+            detail="ffmpeg was not found. Install it and ensure it is on PATH.",
         )
     except RuntimeError as exc:
         update_video_status(session, video, "failed")
         raise HTTPException(status_code=500, detail=str(exc))
     finally:
-        # Always delete the temp WAV — even if transcription raised an exception
         if audio_path and os.path.exists(audio_path):
             os.remove(audio_path)
 
-    # Steps 6 & 7 — persist transcript, update status
     transcript = create_transcript(session, video_id=video_id, content=text, source="whisper")
     update_video_status(session, video, "done")
     return transcript
 
 
+# ---------------------------------------------------------------------------
+# Summarize
+# ---------------------------------------------------------------------------
+
 @router.post("/{video_id}/summarize", response_model=SummaryRead)
 def summarize_video(
     video_id: int,
     session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
 ):
-    """
-    Generate and save a summary for a video's transcript.
+    """Generate and save a summary for an owned video's transcript."""
+    _get_owned_video(session, video_id, current_user.id)  # ownership gate
 
-    How it works:
-      1. Confirm the video exists.
-      2. Confirm a transcript exists — a summary cannot be created without one.
-      3. Return the existing summary if one already exists (idempotent).
-      4. Generate a summary from the transcript text.
-      5. Save the summary to the DB and return it.
-
-    To upgrade from local summarization to OpenAI later, only
-    summary_service.generate_summary() needs to change — nothing here.
-    """
-    # Step 1 — confirm the video exists
-    video = get_video_by_id(session, video_id)
-    if video is None:
-        raise HTTPException(status_code=404, detail=f"Video {video_id} not found.")
-
-    # Step 2 — confirm a transcript exists
     transcript = get_transcript_by_video_id(session, video_id)
     if transcript is None:
         raise HTTPException(
             status_code=422,
-            detail=(
-                f"No transcript found for video {video_id}. "
-                "Run POST /api/v1/videos/{video_id}/transcribe first."
-            ),
+            detail=f"No transcript for video {video_id}. Run /transcribe first.",
         )
 
-    # Step 3 — idempotency: return existing summary without regenerating
     existing = get_summary_by_video_id(session, video_id)
     if existing is not None:
-        return existing
+        return existing  # idempotent
 
-    # Step 4 — generate the summary from the transcript text
     summary_text = generate_summary(transcript.content or "")
-
-    # Step 5 — persist and return
     return create_summary(session, video_id=video_id, content=summary_text, source="local")
 
+
+# ---------------------------------------------------------------------------
+# Chunk — create
+# ---------------------------------------------------------------------------
 
 @router.post("/{video_id}/chunk", response_model=List[ChunkRead])
 def chunk_transcript(
     video_id: int,
     session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
 ):
-    """
-    Split a video's transcript into chunks and save them.
+    """Split an owned video's transcript into chunks."""
+    _get_owned_video(session, video_id, current_user.id)  # ownership gate
 
-    How it works:
-      1. Confirm the video exists.
-      2. Confirm a transcript exists — chunking requires text to split.
-      3. Return existing chunks immediately if already chunked (idempotent).
-      4. Split the transcript text into overlapping fixed-size chunks.
-      5. Save all chunks to the DB and return them.
-
-    Chunk settings (in chunk_service.py):
-      chunk_size = 500 characters
-      overlap    = 50 characters
-
-    These defaults work well for short-to-medium lecture segments.
-    Adjust them in split_into_chunks() when you add embeddings.
-    """
-    # Step 1 — confirm the video exists
-    video = get_video_by_id(session, video_id)
-    if video is None:
-        raise HTTPException(status_code=404, detail=f"Video {video_id} not found.")
-
-    # Step 2 — confirm a transcript exists
     transcript = get_transcript_by_video_id(session, video_id)
     if transcript is None:
         raise HTTPException(
             status_code=422,
-            detail=(
-                f"No transcript found for video {video_id}. "
-                "Run POST /api/v1/videos/{video_id}/transcribe first."
-            ),
+            detail=f"No transcript for video {video_id}. Run /transcribe first.",
         )
 
-    # Step 3 — idempotency: return existing chunks without re-splitting
     if chunks_exist_for_video(session, video_id):
-        return get_chunks_by_video_id(session, video_id)
+        return get_chunks_by_video_id(session, video_id)  # idempotent
 
-    # Step 4 — split the transcript into chunks
     raw_chunks = split_into_chunks(transcript.content or "")
-
-    # Step 5 — persist and return
     return create_chunks(session, video_id=video_id, chunks=raw_chunks)
 
+
+# ---------------------------------------------------------------------------
+# Chunk — list
+# ---------------------------------------------------------------------------
 
 @router.get("/{video_id}/chunks", response_model=List[ChunkRead])
 def list_chunks(
     video_id: int,
     session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
 ):
-    """
-    Return all saved chunks for a video, ordered by chunk_index.
-
-    Raises 404 if the video does not exist.
-    Returns an empty list if the transcript has not been chunked yet
-    (call POST /{video_id}/chunk first).
-    """
-    video = get_video_by_id(session, video_id)
-    if video is None:
-        raise HTTPException(status_code=404, detail=f"Video {video_id} not found.")
-
+    """Return all chunks for an owned video."""
+    _get_owned_video(session, video_id, current_user.id)  # ownership gate
     return get_chunks_by_video_id(session, video_id)
 
+
+# ---------------------------------------------------------------------------
+# Embed
+# ---------------------------------------------------------------------------
 
 @router.post("/{video_id}/embed", response_model=List[ChunkRead])
 def embed_video_chunks(
     video_id: int,
     session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
 ):
-    """
-    Generate and save embeddings for all chunks of a video's transcript.
+    """Generate embeddings for all chunks of an owned video."""
+    _get_owned_video(session, video_id, current_user.id)  # ownership gate
 
-    How it works:
-      1. Confirm the video exists.
-      2. Confirm chunks exist — embedding requires chunked text.
-      3. Embed every un-embedded chunk and persist the vectors.
-      4. Return all chunks (is_embedded=True once done).
-
-    Idempotent: chunks that already have is_embedded=True are skipped.
-    Safe to call multiple times — only pending chunks are processed.
-
-    Current embedding: 26-dimensional character-frequency placeholder.
-    To upgrade to real embeddings (e.g. OpenAI text-embedding-3-small),
-    replace embed_text() in embedding_service.py — nothing else changes.
-    """
-    # Step 1 — confirm the video exists
-    video = get_video_by_id(session, video_id)
-    if video is None:
-        raise HTTPException(status_code=404, detail=f"Video {video_id} not found.")
-
-    # Step 2 — confirm chunks exist
     if not chunks_exist_for_video(session, video_id):
         raise HTTPException(
             status_code=422,
-            detail=(
-                f"No chunks found for video {video_id}. "
-                "Run POST /api/v1/videos/{video_id}/chunk first."
-            ),
+            detail=f"No chunks for video {video_id}. Run /chunk first.",
         )
-
-    # Step 3 & 4 — embed pending chunks and return all
     return embed_all_chunks(session, video_id)
 
+
+# ---------------------------------------------------------------------------
+# Semantic search
+# ---------------------------------------------------------------------------
 
 @router.post("/{video_id}/search", response_model=List[RetrievedChunkRead])
 def search_video_chunks(
     video_id: int,
     request: SearchChunksRequest,
     session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
 ):
-    """
-    Semantic search over a video's transcript chunks.
+    """Semantic search over an owned video's transcript chunks."""
+    _get_owned_video(session, video_id, current_user.id)  # ownership gate
 
-    How it works:
-      1. Confirm the video exists.
-      2. Embed the query string using the same local model used for chunks.
-      3. Compute cosine similarity between the query and every embedded chunk.
-      4. Return the top_k most relevant chunks, highest similarity first.
-
-    Prerequisites:
-      - POST /{video_id}/transcribe must have been called first.
-      - POST /{video_id}/chunk must have been called first.
-      - POST /{video_id}/embed must have been called first.
-
-    Request body:
-      { "query": "מה הנושא הראשי?", "top_k": 5 }
-    """
-    # Step 1 — confirm the video exists
-    video = get_video_by_id(session, video_id)
-    if video is None:
-        raise HTTPException(status_code=404, detail=f"Video {video_id} not found.")
-
-    # Steps 2–4 — embed query, score chunks, return ranked results
     try:
-        results = search_chunks(
+        return search_chunks(
             session=session,
             video_id=video_id,
             query=request.query,
@@ -421,44 +354,21 @@ def search_video_chunks(
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
-    return results
 
+# ---------------------------------------------------------------------------
+# Ask (RAG)
+# ---------------------------------------------------------------------------
 
 @router.post("/{video_id}/ask", response_model=AskResponse)
 def ask_question(
     video_id: int,
     request: AskRequest,
     session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
 ):
-    """
-    Answer a question about a video using RAG (Retrieval-Augmented Generation).
+    """Answer a question about an owned video using RAG."""
+    _get_owned_video(session, video_id, current_user.id)  # ownership gate
 
-    How it works:
-      1. Confirm the video exists.
-      2. Retrieve the top_k most relevant transcript chunks for the question
-         (same cosine-similarity search as /search).
-      3. Inject those chunks as context into a prompt.
-      4. Send the prompt to OpenAI and return the grounded answer.
-
-    The answer is grounded in the transcript — the LLM is instructed to
-    answer ONLY from the provided chunks and say "I don't know" if the
-    answer isn't there. This prevents hallucination outside the video content.
-
-    Prerequisites:
-      - POST /{video_id}/transcribe must have been called.
-      - POST /{video_id}/chunk must have been called.
-      - POST /{video_id}/embed must have been called.
-      - OPENAI_API_KEY must be set in .env.
-
-    Request body example:
-      { "question": "What did the lecturer say about recursion?", "top_k": 3 }
-    """
-    # Step 1 — confirm the video exists
-    video = get_video_by_id(session, video_id)
-    if video is None:
-        raise HTTPException(status_code=404, detail=f"Video {video_id} not found.")
-
-    # Steps 2–4 — retrieve, build prompt, generate answer
     try:
         return answer_question(
             session=session,
@@ -467,60 +377,31 @@ def ask_question(
             top_k=request.top_k,
         )
     except ValueError as exc:
-        # No embedded chunks exist yet
         raise HTTPException(status_code=422, detail=str(exc))
     except RuntimeError as exc:
-        # openai not installed or API key missing
         raise HTTPException(status_code=500, detail=str(exc))
 
+
+# ---------------------------------------------------------------------------
+# Quiz
+# ---------------------------------------------------------------------------
 
 @router.post("/{video_id}/quiz", response_model=QuizResponse)
 def generate_video_quiz(
     video_id: int,
     request: QuizRequest,
     session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
 ):
-    """
-    Generate multiple-choice quiz questions grounded in a video's transcript.
+    """Generate a quiz grounded in an owned video's transcript."""
+    _get_owned_video(session, video_id, current_user.id)  # ownership gate
 
-    How it works:
-      1. Confirm the video exists.
-      2. Confirm embedded chunks exist — quiz generation requires embedded text.
-      3. Sample transcript chunks evenly across the video for broad coverage.
-      4. Send those chunks to OpenAI and ask for multiple-choice questions.
-      5. Parse the JSON response and return structured quiz questions.
-
-    Prerequisites:
-      - POST /{video_id}/transcribe must have been called.
-      - POST /{video_id}/chunk must have been called.
-      - POST /{video_id}/embed must have been called.
-      - OPENAI_API_KEY must be set in .env.
-
-    Request body example:
-      { "num_questions": 5, "top_k": 10 }
-
-    Each question includes:
-      - question text
-      - 4 answer options (A, B, C, D)
-      - the correct answer
-    """
-    # Step 1 — confirm the video exists
-    video = get_video_by_id(session, video_id)
-    if video is None:
-        raise HTTPException(status_code=404, detail=f"Video {video_id} not found.")
-
-    # Step 2 — confirm chunks exist (quiz_service will check for embeddings)
     if not chunks_exist_for_video(session, video_id):
         raise HTTPException(
             status_code=422,
-            detail=(
-                f"No chunks found for video {video_id}. "
-                "Run POST /api/v1/videos/{video_id}/chunk then "
-                "POST /api/v1/videos/{video_id}/embed first."
-            ),
+            detail=f"No chunks for video {video_id}. Run /chunk then /embed first.",
         )
 
-    # Steps 3–5 — sample chunks, call OpenAI, parse and return
     try:
         return generate_quiz(
             session=session,
@@ -529,16 +410,38 @@ def generate_video_quiz(
             top_k=request.top_k,
         )
     except ValueError as exc:
-        # No embedded chunks, or OpenAI returned malformed JSON
         raise HTTPException(status_code=422, detail=str(exc))
     except RuntimeError as exc:
-        # openai not installed or API key missing
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-@router.get("/", response_model=List[VideoRead])
-def list_videos(
+# ---------------------------------------------------------------------------
+# Delete
+# ---------------------------------------------------------------------------
+
+from fastapi import Response
+
+@router.delete("/{video_id}", status_code=204)
+def delete_video_endpoint(
+    video_id: int,
     session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
 ):
-    """Return all videos for user_id=1 (hardcoded until auth is implemented)."""
-    return get_videos_for_user(session, user_id=1)
+    """
+    Permanently delete a video owned by the authenticated user.
+
+    Ownership is enforced via _get_owned_video():
+      - 401 if the JWT is missing or invalid
+      - 404 if the video does not exist
+      - 403 if the video belongs to a different user
+    """
+    video = _get_owned_video(session, video_id, current_user.id)
+
+    # Remove the file from disk if it exists
+    if video.file_path:
+        file = Path(video.file_path)
+        if file.exists():
+            file.unlink()
+
+    delete_video(session, video)
+    return Response(status_code=204)

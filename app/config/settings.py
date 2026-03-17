@@ -72,6 +72,18 @@ class Settings(BaseSettings):
     SECRET_KEY: str = "changeme"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
 
+    # --- Google OAuth ---
+    # Create credentials at https://console.cloud.google.com/apis/credentials
+    # Set the redirect URI to: http://127.0.0.1:8000/api/v1/auth/google/callback
+    GOOGLE_CLIENT_ID: str = ""
+    GOOGLE_CLIENT_SECRET: str = ""
+    GOOGLE_REDIRECT_URI: str = "http://127.0.0.1:8000/api/v1/auth/google/callback"
+
+    # --- Frontend ---
+    # After Google OAuth, the backend redirects here with ?token=<jwt>.
+    # The frontend /auth/callback page reads the token and stores it.
+    FRONTEND_URL: str = "http://localhost:5173"
+
     class Config:
         env_file = str(_ENV_FILE)
         env_file_encoding = "utf-8"

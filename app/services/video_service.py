@@ -55,7 +55,7 @@ def create_video_from_upload(
     session: Session,
     title: str,
     file_path: str,
-    user_id: int = 1,
+    user_id: int,
 ) -> Video:
     """
     Create a Video record in the database after a file has been saved to disk.
@@ -68,8 +68,8 @@ def create_video_from_upload(
         session:   The database session injected by FastAPI.
         title:     The video title — defaults to the original filename for now.
         file_path: The path where the file was saved on disk.
-        user_id:   Hardcoded to 1 until JWT auth is implemented. Every upload
-                   is owned by the placeholder user created at startup.
+        user_id:   The authenticated user's ID from the JWT token.
+                   Must be provided by the router — never a default.
 
     Returns:
         The newly created and database-refreshed Video object.
@@ -135,6 +135,68 @@ def update_video_status(session: Session, video: Video, status: str) -> None:
 
 
 def delete_video(session: Session, video: Video) -> None:
-    """Delete a video record from the database."""
+    """
+    Delete a video and all child records that reference it.
+
+    Deletion order (child → parent to satisfy FK constraints):
+      1. chat_messages  (FK → chat_sessions.id)
+      2. chat_sessions  (FK → videos.id)
+      3. transcript_chunks (FK → videos.id)
+      4. transcripts    (FK → videos.id)
+      5. summaries      (FK → videos.id)
+      6. video          (parent)
+    """
+    import logging
+    from app.models.chat import ChatSession, ChatMessage
+    from app.models.chunk import TranscriptChunk
+    from app.models.transcript import Transcript
+    from app.models.summary import Summary
+
+    log = logging.getLogger(__name__)
+    log.info("delete_video: starting deletion for video_id=%s", video.id)
+
+    # 1. Chat messages (must go before sessions)
+    chat_sessions = session.exec(
+        select(ChatSession).where(ChatSession.video_id == video.id)
+    ).all()
+    for cs in chat_sessions:
+        messages = session.exec(
+            select(ChatMessage).where(ChatMessage.session_id == cs.id)
+        ).all()
+        for msg in messages:
+            session.delete(msg)
+    session.flush()
+
+    # 2. Chat sessions
+    for cs in chat_sessions:
+        session.delete(cs)
+    session.flush()
+
+    # 3. Transcript chunks
+    chunks = session.exec(
+        select(TranscriptChunk).where(TranscriptChunk.video_id == video.id)
+    ).all()
+    for chunk in chunks:
+        session.delete(chunk)
+    session.flush()
+
+    # 4. Transcript
+    transcript = session.exec(
+        select(Transcript).where(Transcript.video_id == video.id)
+    ).first()
+    if transcript:
+        session.delete(transcript)
+        session.flush()
+
+    # 5. Summary
+    summary = session.exec(
+        select(Summary).where(Summary.video_id == video.id)
+    ).first()
+    if summary:
+        session.delete(summary)
+        session.flush()
+
+    # 6. Video (parent)
     session.delete(video)
     session.commit()
+    log.info("delete_video: successfully deleted video_id=%s", video.id)

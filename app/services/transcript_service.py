@@ -1,6 +1,9 @@
+import logging
 import os
 import subprocess
 import tempfile
+
+_log = logging.getLogger(__name__)
 
 from sqlmodel import Session, select
 
@@ -111,7 +114,14 @@ try:
         device=settings.WHISPER_DEVICE,
         compute_type=settings.WHISPER_COMPUTE_TYPE,
     )
-except Exception:  # faster-whisper not installed — server still starts
+    _log.info("faster-whisper loaded: model=%s device=%s compute=%s",
+              settings.WHISPER_MODEL, settings.WHISPER_DEVICE, settings.WHISPER_COMPUTE_TYPE)
+except ImportError:
+    _log.warning("faster-whisper is not installed — transcription unavailable")
+    _whisper_model = None
+except Exception as _exc:
+    _log.error("faster-whisper model failed to load (%s: %s) — transcription unavailable",
+               type(_exc).__name__, _exc)
     _whisper_model = None
 
 

@@ -1,10 +1,10 @@
 # --- Web framework ---
-fastapi==0.135.1
+fastapi==0.115.5
 uvicorn[standard]==0.32.1
 
 # --- Database ---
 sqlmodel==0.0.22          # SQLModel = SQLAlchemy + Pydantic in one
-psycopg[binary]==3.2.3    # PostgreSQL driver (v3, pre-built wheel, no pg_config needed)
+psycopg[binary]==3.2.9    # PostgreSQL driver (v3, pre-built wheel, no pg_config needed)
 alembic==1.14.0           # Database migration tool (for future use)
 
 # --- Settings ---
@@ -18,17 +18,7 @@ python-jose[cryptography]==3.3.0  # JWT tokens
 email-validator==2.2.0    # Enables pydantic EmailStr validation
 
 # --- Transcription ---
-faster-whisper            # CTranslate2-based Whisper: faster CPU inference, same model weights
-
-# --- Embeddings ---
-sentence-transformers     # Local semantic embedding model (all-MiniLM-L6-v2 default)
-                          # Brings in torch (needed for embedding; faster-whisper uses ctranslate2)
-
-# --- LLM / Answer generation ---
-openai>=1.0.0             # OpenAI Python SDK v1+ (used only for /ask endpoint)
-
-# --- MCP ---
-mcp>=1.0.0                # Model Context Protocol server SDK (stdio adapter)
+openai-whisper            # OpenAI Whisper speech-to-text (pins its own torch/numpy deps)
 
 # --- Testing ---
 pytest==8.3.4
