@@ -138,8 +138,10 @@ celerybeat.pid
 .env
 .envrc
 .venv
+.venv*/
 env/
 venv/
+venv*/
 ENV/
 env.bak/
 venv.bak/
@@ -206,3 +208,6 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 uploads/
+
+# Claude Code local settings (project-level local overrides — not for sharing)
+.claude/settings.local.json
