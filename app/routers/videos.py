@@ -14,7 +14,7 @@ import os
 from pathlib import Path
 from typing import List
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Response, UploadFile, File
 from sqlmodel import Session
 
 from app.config.settings import settings
@@ -28,18 +28,16 @@ from app.schemas.quiz import QuizRequest, QuizResponse
 from app.schemas.retrieval import RetrievedChunkRead, SearchChunksRequest
 from app.schemas.summary import SummaryRead
 from app.schemas.transcript import TranscriptRead
-from app.schemas.video import VideoRead
+from app.schemas.video import VideoRead, TranscribeAccepted
 from app.services.summary_service import (
     create_summary,
     generate_summary,
     get_summary_by_video_id,
 )
 from app.services.transcript_service import (
-    create_transcript,
-    extract_audio,
     get_transcript_by_video_id,
     get_video_by_id,
-    transcribe_audio,
+    run_transcription_background,
 )
 from app.services.chunk_service import (
     chunks_exist_for_video,
@@ -100,6 +98,43 @@ def _get_owned_video(session: Session, video_id: int, user_id: int) -> Video:
             detail="You do not have permission to access this video.",
         )
     return video
+
+
+_PIPELINE_IN_PROGRESS = {"processing", "transcribed", "indexing"}
+
+
+def _require_ready(video: Video) -> None:
+    """
+    Raise an appropriate HTTP error if the video is not yet fully processed.
+
+    409  — pipeline is still running (processing / transcribed / indexing).
+    422  — pipeline failed or video has never been transcribed.
+    """
+    if video.status in _PIPELINE_IN_PROGRESS:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Video {video.id} is still being processed "
+                f"(status='{video.status}'). "
+                "Poll GET /api/v1/videos/{video_id} until status is 'ready'."
+            ),
+        )
+    if video.status == "failed":
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Video {video.id} processing failed. "
+                "Re-upload and transcribe to try again."
+            ),
+        )
+    if video.status != "ready":
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Video {video.id} is not ready (status='{video.status}'). "
+                "Run POST /transcribe first."
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +206,25 @@ def list_videos(
 
 
 # ---------------------------------------------------------------------------
+# Get single video (useful for polling transcription status)
+# ---------------------------------------------------------------------------
+
+@router.get("/{video_id}", response_model=VideoRead)
+def get_video(
+    video_id: int,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Return a single owned video by ID.
+
+    Intended for status polling after POST /transcribe:
+    call this endpoint repeatedly until `status` is "ready" or "failed".
+    """
+    return _get_owned_video(session, video_id, current_user.id)
+
+
+# ---------------------------------------------------------------------------
 # Transcript — read
 # ---------------------------------------------------------------------------
 
@@ -197,14 +251,29 @@ def get_transcript(
 # Transcribe
 # ---------------------------------------------------------------------------
 
-@router.post("/{video_id}/transcribe", response_model=TranscriptRead)
+@router.post("/{video_id}/transcribe", response_model=TranscribeAccepted)
 def transcribe_video(
     video_id: int,
+    background_tasks: BackgroundTasks,
+    response: Response,
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ):
-    """Trigger Whisper transcription for an owned video."""
-    video = _get_owned_video(session, video_id, current_user.id)  # ownership gate
+    """
+    Dispatch Whisper transcription for an owned video.
+
+    Returns 202 immediately — the full pipeline runs in the background.
+    Poll GET /api/v1/videos/{video_id} and check `status`:
+      "processing"  → extracting audio + running Whisper
+      "transcribed" → transcript done, chunking about to start
+      "indexing"    → chunking / embedding in progress
+      "ready"       → transcript + embeddings ready; all endpoints available
+      "failed"      → pipeline encountered an error (check server logs)
+
+    Returns 200 if the video is already ready (no new job is started).
+    Returns 409 if the pipeline is already running for this video.
+    """
+    video = _get_owned_video(session, video_id, current_user.id)
 
     if not video.file_path or not Path(video.file_path).exists():
         raise HTTPException(
@@ -212,31 +281,42 @@ def transcribe_video(
             detail=f"Video {video_id} has no file on disk. Upload the file first.",
         )
 
-    existing = get_transcript_by_video_id(session, video_id)
-    if existing is not None:
-        return existing  # idempotent
-
-    update_video_status(session, video, "processing")
-    audio_path = None
-    try:
-        audio_path = extract_audio(video.file_path)
-        text = transcribe_audio(audio_path)
-    except FileNotFoundError:
-        update_video_status(session, video, "failed")
-        raise HTTPException(
-            status_code=500,
-            detail="ffmpeg was not found. Install it and ensure it is on PATH.",
+    # Already fully processed — nothing to do.
+    if video.status == "ready":
+        response.status_code = 200
+        return TranscribeAccepted(
+            message="Video is already ready. Fetch the transcript at GET /transcript.",
+            video_id=video_id,
+            status="ready",
         )
-    except RuntimeError as exc:
-        update_video_status(session, video, "failed")
-        raise HTTPException(status_code=500, detail=str(exc))
-    finally:
-        if audio_path and os.path.exists(audio_path):
-            os.remove(audio_path)
 
-    transcript = create_transcript(session, video_id=video_id, content=text, source="whisper")
-    update_video_status(session, video, "done")
-    return transcript
+    # Already running — reject to avoid duplicate jobs.
+    if video.status in _PIPELINE_IN_PROGRESS:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Video {video_id} is already being processed "
+                f"(status='{video.status}'). "
+                "Poll GET /api/v1/videos/{video_id} for status updates."
+            ),
+        )
+
+    # Mark as processing synchronously so the client sees the state
+    # change the instant the 202 is received, before the task even starts.
+    update_video_status(session, video, "processing")
+
+    background_tasks.add_task(run_transcription_background, video_id)
+
+    response.status_code = 202
+    return TranscribeAccepted(
+        message=(
+            "Transcription started. "
+            "Poll GET /api/v1/videos/{video_id} until status is 'ready', "
+            "then fetch the transcript at GET /api/v1/videos/{video_id}/transcript."
+        ),
+        video_id=video_id,
+        status="processing",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -342,7 +422,8 @@ def search_video_chunks(
     current_user: User = Depends(get_current_user),
 ):
     """Semantic search over an owned video's transcript chunks."""
-    _get_owned_video(session, video_id, current_user.id)  # ownership gate
+    video = _get_owned_video(session, video_id, current_user.id)
+    _require_ready(video)
 
     try:
         return search_chunks(
@@ -367,7 +448,8 @@ def ask_question(
     current_user: User = Depends(get_current_user),
 ):
     """Answer a question about an owned video using RAG."""
-    _get_owned_video(session, video_id, current_user.id)  # ownership gate
+    video = _get_owned_video(session, video_id, current_user.id)
+    _require_ready(video)
 
     try:
         return answer_question(
@@ -394,13 +476,8 @@ def generate_video_quiz(
     current_user: User = Depends(get_current_user),
 ):
     """Generate a quiz grounded in an owned video's transcript."""
-    _get_owned_video(session, video_id, current_user.id)  # ownership gate
-
-    if not chunks_exist_for_video(session, video_id):
-        raise HTTPException(
-            status_code=422,
-            detail=f"No chunks for video {video_id}. Run /chunk then /embed first.",
-        )
+    video = _get_owned_video(session, video_id, current_user.id)
+    _require_ready(video)
 
     try:
         return generate_quiz(
@@ -418,8 +495,6 @@ def generate_video_quiz(
 # ---------------------------------------------------------------------------
 # Delete
 # ---------------------------------------------------------------------------
-
-from fastapi import Response
 
 @router.delete("/{video_id}", status_code=204)
 def delete_video_endpoint(

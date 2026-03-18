@@ -13,8 +13,7 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# OpenAI client — created lazily on first use so the server starts even
-# if the openai package is not installed or the key is not yet configured.
+# OpenAI client — lazy init so the server starts without a key configured.
 # ---------------------------------------------------------------------------
 
 def _get_openai_client():
@@ -43,94 +42,151 @@ def _get_openai_client():
 
 
 # ---------------------------------------------------------------------------
-# Prompt builder
-#
-# The prompt is the most important part of a RAG system.
-# Two rules keep answers grounded in the transcript:
-#
-#   1. The system message tells the LLM it ONLY has the provided context —
-#      it must not use outside knowledge.
-#   2. The user message explicitly asks for "I don't know" if the answer
-#      is not in the context — this prevents confident hallucinations.
-#
-# The numbered-chunk format makes it easy to audit which chunk the answer
-# came from during development.
+# Language hint — used for logging only (no external dependency needed)
 # ---------------------------------------------------------------------------
 
-def _build_prompt(question: str, chunks: List[RetrievedChunkRead]) -> str:
+def _detect_language_hint(text: str) -> str:
     """
-    Build the user-turn message that combines context chunks with the question.
-
-    The system message (sent separately in the API call) already tells the
-    LLM to stay within the provided context. This function builds the
-    user-turn content only.
-
-    Args:
-        question:  The user's question.
-        chunks:    The retrieved transcript chunks to use as context.
-
-    Returns:
-        A formatted string combining the context and the question.
+    Return 'he' if the text contains Hebrew characters, otherwise 'en'.
+    Used for structured logging — not for prompt routing.
     """
-    context_blocks = "\n\n".join(
-        f"[Chunk {i + 1}]\n{chunk.content}"
-        for i, chunk in enumerate(chunks)
-    )
+    return "he" if any("\u0590" <= c <= "\u05FF" for c in text) else "en"
 
+
+# ---------------------------------------------------------------------------
+# Unified system prompt
+#
+# A single system message drives both LECTURE and GENERAL modes.
+# The mode is signalled in the user-turn prompt (MODE: LECTURE / MODE: GENERAL)
+# so the LLM understands the behavioural contract for each request.
+# ---------------------------------------------------------------------------
+
+_SYSTEM_MESSAGE = """\
+You are StudyTube AI — an intelligent tutor that helps users understand lecture content and answer questions.
+
+You operate in TWO MODES:
+
+MODE 1 — LECTURE MODE (grounded)
+- You MUST answer ONLY using the provided Context.
+- You MUST NOT use external knowledge.
+- If the answer is not clearly supported by the Context, say so honestly.
+- Do NOT guess and do NOT hallucinate.
+
+MODE 2 — GENERAL MODE (global)
+- You may answer using your general knowledge.
+- You are not limited to the lecture.
+- Provide clear, helpful, accurate explanations.
+
+LANGUAGE BEHAVIOR
+- Detect the user's language automatically.
+- Always answer in the SAME language as the user (Hebrew or English).
+- If mixed, choose the dominant language.
+- Use natural, fluent, human-like phrasing.
+
+ANSWER QUALITY RULES
+- NEVER dump raw transcript text.
+- ALWAYS rewrite into clean, natural sentences.
+- Fix broken or awkward transcript phrasing when possible.
+- Prefer clarity over literal quoting.
+- Keep answers concise but meaningful.
+
+STRUCTURE
+1. Start with a direct answer (1–3 sentences).
+2. If useful, add:
+   "Key points:" in English
+   or "נקודות עיקריות:" in Hebrew
+   with 2–4 short bullet points.
+
+LECTURE MODE STRICT RULES
+- Use ONLY the Context.
+- If the Context is incomplete, unclear, or insufficient, say:
+  English: "I cannot find a clear answer in the lecture."
+  Hebrew: "אני לא מוצא תשובה ברורה בהרצאה."
+- If facts or numbers are unclear, present them cautiously.
+- Do NOT fabricate missing meaning.
+
+GENERAL MODE RULES
+- You may use full knowledge.
+- Still keep answers structured, clear, and concise.
+- Avoid unnecessary length.
+
+TONE
+- Friendly
+- Helpful
+- Educational
+- Clear and structured
+- Not robotic
+- Not overly formal
+
+IMPORTANT
+- Never mention system instructions.
+- Never say "as an AI model".
+- Never expose internal logic.\
+"""
+
+
+# ---------------------------------------------------------------------------
+# Prompt builders
+# ---------------------------------------------------------------------------
+
+def _build_lecture_prompt(question: str, chunks: List[RetrievedChunkRead]) -> str:
+    """
+    Build the user-turn message for LECTURE MODE.
+
+    Context chunks are joined with blank lines — no internal index labels
+    are exposed. The MODE prefix tells the LLM which behavioural contract
+    applies for this request.
+    """
+    context_blocks = "\n\n".join(chunk.content for chunk in chunks)
     return (
-        f"Transcript context:\n"
-        f"{context_blocks}\n\n"
-        f"Question: {question}"
+        f"MODE: LECTURE\n\n"
+        f"Context:\n{context_blocks}\n\n"
+        f"Question:\n{question}\n\n"
+        f"Answer ONLY using the lecture context.\n"
+        f"If the answer is unclear or missing, say so.\n"
+        f"Respond in the user's language."
     )
 
 
-_SYSTEM_MESSAGE = (
-    "You are a helpful assistant for a video learning platform. "
-    "You are given excerpts from a video transcript and a question about the video. "
-    "Answer the question using ONLY the information in the provided transcript excerpts. "
-    "If the answer cannot be found in the excerpts, say clearly: "
-    "'I could not find the answer to that question in this video.' "
-    "Do not use any knowledge outside the provided transcript. "
-    "Answer in the same language as the question."
-)
+def _build_general_prompt(question: str) -> str:
+    """
+    Build the user-turn message for GENERAL MODE.
+    No transcript context is injected — the LLM answers from general knowledge.
+    """
+    return (
+        f"MODE: GENERAL\n\n"
+        f"Question:\n{question}\n\n"
+        f"Answer clearly using your knowledge.\n"
+        f"Respond in the user's language."
+    )
+
+
+def _build_no_context_prompt(question: str) -> str:
+    """
+    Build the user-turn message used when retrieval found no relevant chunks
+    (below RAG_LOW_THRESHOLD). The LLM is asked to say "not found" in the
+    user's own language instead of returning a hardcoded English string.
+    """
+    return (
+        f"MODE: LECTURE\n\n"
+        f"Context:\n[No relevant lecture content was found for this question.]\n\n"
+        f"Question:\n{question}\n\n"
+        f"Answer ONLY using the lecture context.\n"
+        f"If the answer is unclear or missing, say so.\n"
+        f"Respond in the user's language."
+    )
 
 
 # ---------------------------------------------------------------------------
-# Main QA function
+# General-knowledge answer
 # ---------------------------------------------------------------------------
-
-_FALLBACK_ANSWER = (
-    "I could not find enough relevant information in this video to answer confidently. "
-    "Try rephrasing your question or asking about a topic that is covered in the transcript."
-)
-
-
-# ---------------------------------------------------------------------------
-# General-knowledge fallback
-#
-# Used only when the lecture retrieval score is below RAG_LOW_THRESHOLD,
-# meaning the transcript almost certainly does not cover the question.
-# In that case, instead of returning the static fallback string, we call
-# OpenAI in a general-assistant mode so the student still gets a useful answer.
-#
-# This is intentionally a separate prompt and separate function from the
-# grounded lecture flow — the two modes must never be mixed.
-# ---------------------------------------------------------------------------
-
-_GENERAL_SYSTEM_MESSAGE = (
-    "You are a helpful AI study assistant. "
-    "Answer the student's question using your general knowledge. "
-    "Be clear, concise, and educational. "
-    "Answer in the same language as the question."
-)
-
 
 def _general_answer(question: str, model: str = "gpt-4o-mini") -> str:
     """
-    Answer a question from general knowledge, with no transcript context.
+    Answer a question from general knowledge with no transcript context.
 
-    Called when the lecture retrieval score is below RAG_LOW_THRESHOLD,
-    meaning the transcript does not cover the question at all.
+    Uses the unified system prompt with a MODE: GENERAL user turn so the
+    quality and language rules are consistent with lecture mode.
 
     Args:
         question: The student's question.
@@ -146,21 +202,66 @@ def _general_answer(question: str, model: str = "gpt-4o-mini") -> str:
     response = client.chat.completions.create(
         model=model,
         messages=[
-            {"role": "system", "content": _GENERAL_SYSTEM_MESSAGE},
-            {"role": "user",   "content": question},
+            {"role": "system", "content": _SYSTEM_MESSAGE},
+            {"role": "user",   "content": _build_general_prompt(question)},
         ],
-        temperature=0.5,   # slightly higher than lecture mode — general answers are more open-ended
+        temperature=0.5,
         max_tokens=1024,
     )
     return response.choices[0].message.content.strip()
 
 
-# The exact phrase the strict system prompt instructs the LLM to use when it
-# cannot find the answer in the provided transcript excerpts.
-# Used to detect the "OpenAI was called but couldn't answer from the lecture"
-# case — which must also fall back to general knowledge.
-_LECTURE_NOT_FOUND_PHRASE = "I could not find the answer to that question in this video."
+# ---------------------------------------------------------------------------
+# Lecture "not found" answer
+#
+# Called when retrieval score is below RAG_LOW_THRESHOLD — meaning no useful
+# chunks exist for this question. Instead of returning a hardcoded English
+# string, we make a small LLM call so the response respects the user's
+# language (Hebrew or English).
+# ---------------------------------------------------------------------------
 
+def _lecture_no_context_answer(question: str, model: str = "gpt-4o-mini") -> str:
+    """
+    Generate a language-aware "not found in lecture" response.
+
+    Used when best_score < RAG_LOW_THRESHOLD so no context chunks are sent.
+    The system prompt instructs the LLM to say it cannot find the answer
+    in the correct language.
+    """
+    client = _get_openai_client()
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": _SYSTEM_MESSAGE},
+            {"role": "user",   "content": _build_no_context_prompt(question)},
+        ],
+        temperature=0.2,
+        max_tokens=150,  # short: just needs to say "not found" politely
+    )
+    return response.choices[0].message.content.strip()
+
+
+# ---------------------------------------------------------------------------
+# Phrase sentinel for answer_question_with_fallback()
+# Both language variants used because the new system prompt produces Hebrew
+# responses for Hebrew questions.
+# ---------------------------------------------------------------------------
+
+_LECTURE_NOT_FOUND_EN = "I cannot find a clear answer in the lecture."
+_LECTURE_NOT_FOUND_HE = "אני לא מוצא תשובה ברורה בהרצאה."
+
+
+def _is_not_found_response(answer: str) -> bool:
+    """Return True if the answer is a 'not found in lecture' signal."""
+    return (
+        _LECTURE_NOT_FOUND_EN in answer
+        or _LECTURE_NOT_FOUND_HE in answer
+    )
+
+
+# ---------------------------------------------------------------------------
+# Mode-aware answer dispatcher (used by chat_service)
+# ---------------------------------------------------------------------------
 
 def answer_for_mode(
     session,
@@ -175,13 +276,13 @@ def answer_for_mode(
     explicit mode chosen by the user.
 
     question_mode = "lecture"
-        Strict RAG flow using the video transcript. The LLM will say it
-        cannot find the answer if the content is not covered. No automatic
-        fallback to general knowledge — the user asked for lecture mode.
+        Strict RAG flow using the video transcript.  The LLM answers only
+        from context; it says "not found" if the content is not covered.
+        No automatic fallback to general knowledge.
 
     question_mode = "general"
-        Skip transcript retrieval entirely. Call OpenAI in general-knowledge
-        mode directly, same as _general_answer().
+        Skip transcript retrieval entirely.  Call OpenAI in general-knowledge
+        mode so the student gets a broad, unrestricted answer.
 
     Returns:
         (answer_text, answer_source) where answer_source is "lecture" or "general".
@@ -190,21 +291,27 @@ def answer_for_mode(
         ValueError:   If no embedded chunks exist for this video (lecture mode only).
         RuntimeError: If openai is not installed or OPENAI_API_KEY is missing.
     """
+    lang = _detect_language_hint(question)
+
     if question_mode == "general":
         logger.info(
-            "answer_for_mode | general  video_id=%d  question=%r",
-            video_id, question[:80],
+            "answer_for_mode | mode=general  lang=%s  video_id=%d  question=%r",
+            lang, video_id, question[:80],
         )
         return _general_answer(question, model), "general"
 
-    # "lecture" — strict grounded flow, no fallback
+    # "lecture" — strict grounded flow, no fallback to general knowledge
     logger.info(
-        "answer_for_mode | lecture  video_id=%d  question=%r",
-        video_id, question[:80],
+        "answer_for_mode | mode=lecture  lang=%s  video_id=%d  question=%r",
+        lang, video_id, question[:80],
     )
     rag_result = answer_question(session, video_id, question, top_k, model)
     return rag_result.answer, "lecture"
 
+
+# ---------------------------------------------------------------------------
+# Lecture-first, general-fallback pipeline (used by the /ask endpoint)
+# ---------------------------------------------------------------------------
 
 def answer_question_with_fallback(
     session,
@@ -217,43 +324,25 @@ def answer_question_with_fallback(
     Lecture-first, general-fallback answer pipeline.
 
     The general fallback triggers in TWO situations:
-      1. confidence_level == "none": score below RAG_LOW_THRESHOLD — no chunks
-         were relevant enough to send to OpenAI at all.
-      2. confidence_level == "low" or "high" BUT the LLM answered with the
-         "I could not find the answer" phrase — meaning chunks were found but
-         were genuinely off-topic (e.g. a borderline similarity score caused by
-         language mismatch on an unrelated question).
+      1. confidence_level == "none": score below RAG_LOW_THRESHOLD — the
+         _lecture_no_context_answer() response was already returned, but
+         we can still escalate to general.
+      2. The LLM returned a "not found" phrase — chunks were retrieved but
+         were genuinely off-topic.
 
     In all other cases the grounded lecture answer is returned as-is.
 
-    Args:
-        session:   DB session.
-        video_id:  The video to query.
-        question:  The student's question.
-        top_k:     Number of chunks to retrieve as context.
-        model:     OpenAI model to use.
-
     Returns:
         (answer_text, answer_source) where answer_source is "lecture" or "general".
-
-    Raises:
-        ValueError:   If no embedded chunks exist for this video (from answer_question).
-        RuntimeError: If openai is not installed or OPENAI_API_KEY is missing.
     """
     rag_result = answer_question(session, video_id, question, top_k, model)
 
     if (
         rag_result.confidence_level != "none"
-        and _LECTURE_NOT_FOUND_PHRASE not in rag_result.answer
+        and not _is_not_found_response(rag_result.answer)
     ):
-        # Grounded answer: OpenAI was called with transcript chunks AND gave a
-        # real answer. The lecture is the source of truth.
         return rag_result.answer, "lecture"
 
-    # Fall through to general AI in two cases:
-    #   - confidence_level == "none": no relevant chunks, OpenAI was not called.
-    #   - OpenAI was called but explicitly said it couldn't find the answer
-    #     (the LLM returned _LECTURE_NOT_FOUND_PHRASE).
     logger.info(
         "fallback | video_id=%d  confidence=%s  triggering general answer  question=%r",
         video_id, rag_result.confidence_level, question[:80],
@@ -261,6 +350,10 @@ def answer_question_with_fallback(
     general_text = _general_answer(question, model)
     return general_text, "general"
 
+
+# ---------------------------------------------------------------------------
+# Core RAG pipeline
+# ---------------------------------------------------------------------------
 
 def answer_question(
     session,
@@ -270,27 +363,21 @@ def answer_question(
     model: str = "gpt-4o-mini",
 ) -> AskResponse:
     """
-    Full RAG pipeline: retrieve relevant chunks, then generate an answer.
+    Full RAG pipeline: retrieve relevant chunks, then generate a grounded answer.
 
     Two-level confidence policy (calibrated for all-MiniLM-L6-v2 on Hebrew):
-      - best_score < RAG_LOW_THRESHOLD   → immediate fallback, no OpenAI call.
+      - best_score < RAG_LOW_THRESHOLD   → language-aware "not found" via LLM.
       - RAG_LOW_THRESHOLD ≤ score
-              < RAG_GOOD_THRESHOLD       → call OpenAI with the same strict
-                                           grounded prompt; mark as "low" confidence.
-      - best_score ≥ RAG_GOOD_THRESHOLD  → normal grounded flow, "high" confidence.
-
-    Why two levels?
-    all-MiniLM-L6-v2 is English-trained. For Hebrew content it still produces
-    meaningful vectors, but scores are systematically 30–50 % lower than for
-    English queries. A score of ~0.20 on Hebrew is equivalent to ~0.35 on
-    English — genuinely relevant, worth sending to the LLM.
+              < RAG_GOOD_THRESHOLD       → call OpenAI with grounded prompt;
+                                           mark as confidence_level="low".
+      - best_score ≥ RAG_GOOD_THRESHOLD  → normal grounded flow; "high" confidence.
 
     Args:
         session:   DB session injected by FastAPI.
         video_id:  The video to answer questions about.
         question:  The user's natural-language question.
         top_k:     Number of chunks to retrieve as context.
-        model:     OpenAI model to use. gpt-4o-mini is fast and cheap.
+        model:     OpenAI model to use.
 
     Returns:
         AskResponse with the answer, grounded flag, confidence_level, and chunks.
@@ -300,13 +387,15 @@ def answer_question(
         RuntimeError: If openai is not installed or OPENAI_API_KEY is missing.
     """
     t_start = time.perf_counter()
+    lang = _detect_language_hint(question)
     question_preview = question[:80] + ("…" if len(question) > 80 else "")
-    logger.info("ask | start  video_id=%d  top_k=%d  question=%r", video_id, top_k, question_preview)
+    logger.info(
+        "ask | start  video_id=%d  top_k=%d  lang=%s  question=%r",
+        video_id, top_k, lang, question_preview,
+    )
 
-    # Step 1 — retrieve relevant chunks using the existing retrieval service.
-    # We always fetch top_k + 2 so we have spare chunks available for the
-    # borderline zone (see Step 2 below). The tiny extra retrieval cost is
-    # worth the improved context coverage for weak-match questions.
+    # Step 1 — retrieve relevant chunks.
+    # Always fetch top_k+2 so the borderline zone has extra context.
     chunks: List[RetrievedChunkRead] = search_chunks(
         session=session,
         video_id=video_id,
@@ -315,57 +404,53 @@ def answer_question(
     )
 
     # Step 2 — two-level quality gate.
-    # chunks are returned highest-similarity-first, so index 0 is the best.
     best_score = chunks[0].similarity_score if chunks else 0.0
     top_scores = [round(c.similarity_score, 3) for c in chunks[:5]]
-    logger.info("ask | retrieval  chunks=%d  best_score=%.3f  top_scores=%s", len(chunks), best_score, top_scores)
+    logger.info(
+        "ask | retrieval  chunks=%d  best_score=%.3f  top_scores=%s  lang=%s",
+        len(chunks), best_score, top_scores, lang,
+    )
 
-    # Below the absolute floor → content is almost certainly off-topic.
-    # Save the API token; return fallback immediately.
+    # Below the absolute floor — no useful content for this question.
+    # Ask the LLM to say so in the user's language instead of returning
+    # a hardcoded English string.
     if best_score < settings.RAG_LOW_THRESHOLD:
         elapsed_ms = int((time.perf_counter() - t_start) * 1000)
         logger.info(
-            "ask | gate  confidence=none  openai_called=false  elapsed_ms=%d  "
-            "(best_score=%.3f below low_threshold=%.2f)",
-            elapsed_ms, best_score, settings.RAG_LOW_THRESHOLD,
+            "ask | gate  confidence=none  lang=%s  openai_called=true (no_context)  "
+            "elapsed_pre_llm_ms=%d  (best_score=%.3f below low_threshold=%.2f)",
+            lang, elapsed_ms, best_score, settings.RAG_LOW_THRESHOLD,
         )
+        fallback_answer = _lecture_no_context_answer(question, model)
         return AskResponse(
             question=question,
-            answer=_FALLBACK_ANSWER,
+            answer=fallback_answer,
             top_k=top_k,
             grounded=False,
             confidence_level="none",
             retrieved_chunks=chunks,
         )
 
-    # Determine confidence level before calling OpenAI.
-    # This is passed through to the response so callers can decide how much
-    # to trust the answer (e.g. show a "low confidence" badge in the UI).
+    # Confidence level for logging and response tagging.
     confidence_level = (
         "high" if best_score >= settings.RAG_GOOD_THRESHOLD else "low"
     )
 
-    # In the borderline zone individual chunks are weakly relevant, so we
-    # send all top_k+2 chunks to give the LLM a wider window to find the
-    # answer. In the high-confidence zone trim back to the requested top_k —
-    # those chunks are already high-quality and we don't need extras.
+    # Borderline zone: send all top_k+2 chunks for wider context.
+    # High-confidence zone: trim to top_k — those chunks are already good.
     context_chunks = chunks if confidence_level == "low" else chunks[:top_k]
 
     context_chars = sum(len(c.content) for c in context_chunks)
     logger.info(
-        "ask | gate  confidence=%s  openai_called=true  "
+        "ask | gate  confidence=%s  lang=%s  openai_called=true  "
         "chunks_sent=%d  context_chars=%d",
-        confidence_level, len(context_chunks), context_chars,
+        confidence_level, lang, len(context_chunks), context_chars,
     )
 
-    # Step 3 — build the prompt
-    user_message = _build_prompt(question, context_chunks)
+    # Step 3 — build the grounded lecture prompt.
+    user_message = _build_lecture_prompt(question, context_chunks)
 
-    # Step 4 — call OpenAI.
-    # We use the same strict grounded system message for BOTH confidence
-    # levels. The LLM is already instructed to say "I don't know" if the
-    # context doesn't contain the answer, so the borderline ("low") case is
-    # safe: if the chunks are genuinely irrelevant, the LLM will say so.
+    # Step 4 — call OpenAI with the unified system prompt + lecture user turn.
     client = _get_openai_client()
     response = client.chat.completions.create(
         model=model,
@@ -373,7 +458,7 @@ def answer_question(
             {"role": "system", "content": _SYSTEM_MESSAGE},
             {"role": "user",   "content": user_message},
         ],
-        temperature=0.2,   # low temperature = more factual, less creative
+        temperature=0.2,   # low temperature = factual, grounded answers
         max_tokens=1024,
     )
 
@@ -381,14 +466,15 @@ def answer_question(
 
     elapsed_ms = int((time.perf_counter() - t_start) * 1000)
     logger.info(
-        "ask | done  grounded=true  confidence=%s  answer_chars=%d  elapsed_ms=%d",
-        confidence_level, len(answer), elapsed_ms,
+        "ask | done  grounded=true  confidence=%s  lang=%s  "
+        "answer_chars=%d  elapsed_ms=%d",
+        confidence_level, lang, len(answer), elapsed_ms,
     )
 
     return AskResponse(
         question=question,
         answer=answer,
-        top_k=len(context_chunks),   # reflect actual chunks sent to the LLM
+        top_k=len(context_chunks),
         grounded=True,
         confidence_level=confidence_level,
         retrieved_chunks=context_chunks,

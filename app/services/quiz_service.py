@@ -223,7 +223,7 @@ def generate_quiz(
     if not all_chunks:
         raise ValueError(
             f"No embedded chunks found for video {video_id}. "
-            "Run POST /chunk then POST /embed first."
+            "Transcribe the video first (POST /transcribe) and wait for status 'ready'."
         )
 
     # Step 2 — sample evenly for broad transcript coverage

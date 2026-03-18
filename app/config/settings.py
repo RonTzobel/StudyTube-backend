@@ -62,15 +62,47 @@ class Settings(BaseSettings):
     RAG_GOOD_THRESHOLD: float = 0.22
 
     # --- Whisper transcription ---
-    # Model size: "medium" is recommended for Hebrew (small/base degrade noticeably).
-    # device="cpu" and compute_type="int8" are safe defaults for Windows / no-GPU setups.
-    WHISPER_MODEL: str = "medium"
+    #
+    # Speed / quality guide for Hebrew lecture content on CPU:
+    #
+    #   WHISPER_MODEL — controls the size of the transcription model.
+    #     "base"    fastest  (~3–6 min per 30-min video on CPU)
+    #               Hebrew accuracy noticeably lower, may miss words/phrases.
+    #     "small"   balanced (~8–15 min per 30-min video on CPU)  ← default
+    #               Good Hebrew accuracy for lecture content.
+    #     "medium"  highest quality (~30–60 min per 30-min video on CPU)
+    #               Impractical for long videos on CPU. Use with GPU only.
+    #
+    #   WHISPER_BEAM_SIZE — beam search width during decoding.
+    #     1   greedy decoding: 2–3× faster, minimal quality loss for structured
+    #         lecture speech. Recommended for CPU.          ← default
+    #     5   Whisper's original default: better recovery of ambiguous words,
+    #         but significantly slower. Use for quality-critical transcriptions.
+    #
+    #   WHISPER_VAD_FILTER — Voice Activity Detection preprocessing.
+    #     True   skip silence and non-speech frames before transcription.
+    #            Saves 10–30 % of processing time for typical lecture videos
+    #            with pauses, intros, or Q&A gaps.          ← default
+    #     False  process all audio including silence.
+    #
+    #   WHISPER_CPU_THREADS — CTranslate2 intra-op thread count.
+    #     0     let CTranslate2 pick automatically (usually uses all cores). ← default
+    #     N     force N threads; try 4–8 on modern multi-core CPUs.
+    #
+    # To restore the old quality-first settings, add to your .env:
+    #   WHISPER_MODEL=medium
+    #   WHISPER_BEAM_SIZE=5
+    #
+    WHISPER_MODEL: str = "small"
     WHISPER_DEVICE: str = "cpu"
     WHISPER_COMPUTE_TYPE: str = "int8"
+    WHISPER_BEAM_SIZE: int = 1
+    WHISPER_VAD_FILTER: bool = True
+    WHISPER_CPU_THREADS: int = 0
 
     # --- Security (placeholder for future JWT auth) ---
     SECRET_KEY: str = "changeme"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 120
 
     # --- Google OAuth ---
     # Create credentials at https://console.cloud.google.com/apis/credentials

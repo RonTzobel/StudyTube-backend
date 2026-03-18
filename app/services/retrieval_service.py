@@ -103,7 +103,7 @@ def search_chunks(
     if not chunks:
         raise ValueError(
             f"No embedded chunks found for video {video_id}. "
-            "Run POST /embed first."
+            "Transcribe the video first (POST /transcribe) and wait for status 'ready'."
         )
 
     # Step 2 — embed the query with the same model used for chunks

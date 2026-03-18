@@ -182,6 +182,21 @@ def send_chat_message(
     if chat_session is None:
         raise ValueError(f"Chat session {session_id} not found.")
 
+    # Lecture mode requires embeddings — check video is fully ready.
+    if question_mode == "lecture":
+        video = get_video_by_id(db, chat_session.video_id)
+        if video is not None and video.status != "ready":
+            status = video.status
+            if status in {"processing", "transcribed", "indexing"}:
+                raise ValueError(
+                    f"Video {chat_session.video_id} is still being processed "
+                    f"(status='{status}'). Try again once status is 'ready'."
+                )
+            raise ValueError(
+                f"Video {chat_session.video_id} is not ready "
+                f"(status='{status}'). Run transcription first."
+            )
+
     # Step 2 — save user message
     user_msg = ChatMessage(
         session_id=session_id,

@@ -32,3 +32,22 @@ class VideoUpdate(BaseModel):
     """Fields the client can update. All optional."""
     title: Optional[str] = None
     description: Optional[str] = None
+
+
+class TranscribeAccepted(BaseModel):
+    """
+    Returned by POST /transcribe.
+
+    202 — pipeline dispatched to background (status: "processing").
+    200 — video already ready, nothing started (status: "ready").
+
+    Poll GET /api/v1/videos/{video_id} and check `status`:
+      "processing"  → audio extraction + Whisper running
+      "transcribed" → transcript done, chunking about to start
+      "indexing"    → chunking / embedding in progress
+      "ready"       → all done; quiz, chat, and search are available
+      "failed"      → pipeline error (check server logs)
+    """
+    message: str
+    video_id: int
+    status: str  # "processing" | "ready"

@@ -62,9 +62,12 @@ def decode_access_token(token: str) -> int | None:
     Decode a JWT and return the user_id (int).
 
     Returns None if the token is invalid, expired, or malformed.
+    TypeError is included because int(None) would be raised if a crafted
+    token carries a JSON null for the "sub" claim, and that must not
+    propagate as an unhandled 500.
     """
     try:
         payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[_ALGORITHM])
         return int(payload["sub"])
-    except (JWTError, KeyError, ValueError):
+    except (JWTError, KeyError, ValueError, TypeError):
         return None
