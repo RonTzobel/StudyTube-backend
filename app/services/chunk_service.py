@@ -244,6 +244,26 @@ def chunks_exist_for_video(session: Session, video_id: int) -> bool:
     return result is not None
 
 
+def delete_chunks_for_video(session: Session, video_id: int) -> int:
+    """
+    Delete all existing chunks (and their embeddings) for a video.
+
+    Returns the number of rows deleted.
+
+    Called by the pipeline before re-creating chunks so that a retry
+    after a failed "indexing" stage does not produce duplicate rows.
+    Embeddings are stored as columns on TranscriptChunk, so deleting
+    the chunks implicitly clears the embeddings too.
+    """
+    chunks = get_chunks_by_video_id(session, video_id)
+    count = len(chunks)
+    for chunk in chunks:
+        session.delete(chunk)
+    if count:
+        session.commit()
+    return count
+
+
 def create_chunks(
     session: Session,
     video_id: int,

@@ -23,10 +23,19 @@ class Video(SQLModel, table=True):
     title: str = Field(nullable=False)
     description: Optional[str] = Field(default=None)
 
-    # Where the video file is stored (local path or cloud URL — TBD)
+    # Original filename as provided by the uploader (display only).
+    original_filename: Optional[str] = Field(default=None)
+
+    # S3 object key, e.g. "videos/7/abc123.mp4".
+    # This is the canonical reference to the video file.
+    # The bucket name and region come from settings — never stored here.
+    s3_key: Optional[str] = Field(default=None)
+
+    # Local filesystem path — kept for backward compatibility with videos
+    # uploaded before S3 migration, and as a temp path during worker processing.
     file_path: Optional[str] = Field(default=None)
 
-    # Processing states: pending → processing → done → failed
-    status: str = Field(default="pending")
+    # Processing states: uploaded → queued → processing → transcribed → indexing → ready | failed
+    status: str = Field(default="uploaded")
 
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

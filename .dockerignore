@@ -1,0 +1,93 @@
+# =============================================================
+# .dockerignore — StudyTube Backend
+# =============================================================
+# Docker sends ONLY what is NOT listed here into the build context.
+# Without this file Docker sends the entire directory (including
+# venv311/, uploads/, .git/) which creates a 1GB+ context.
+#
+# Rule of thumb: if it isn't needed to RUN the app inside the
+# container, it must be listed here.
+# =============================================================
+
+# ------------------------------------------------------------------
+# Virtual environments
+# The entire local venv (torch, ctranslate2, whisper, sentence-
+# transformers…) is 2–3 GB. Packages are installed fresh inside
+# the image via pip install -r requirements.txt.
+# ------------------------------------------------------------------
+venv/
+.venv/
+venv*/
+.venv*/
+venv311/
+env/
+.env/
+
+# ------------------------------------------------------------------
+# Uploaded user files
+# Video files can be hundreds of MB each. They live on the host
+# and are mounted into the container via the Docker volume:
+#   volumes: - ./uploads:/app/uploads
+# They must never be baked into the image.
+# ------------------------------------------------------------------
+uploads/
+
+# ------------------------------------------------------------------
+# Git repository
+# The full object store is not needed inside the container.
+# ------------------------------------------------------------------
+.git/
+.gitignore
+
+# ------------------------------------------------------------------
+# Secrets
+# .env contains DATABASE_URL, OPENAI_API_KEY, SECRET_KEY, etc.
+# These are passed in at runtime by docker-compose env_file / environment.
+# Baking them into the image would be a security risk.
+# ------------------------------------------------------------------
+.env
+.env.*
+
+# ------------------------------------------------------------------
+# Claude Code project files
+# ------------------------------------------------------------------
+.claude/
+
+# ------------------------------------------------------------------
+# Python bytecode and caches
+# These are regenerated automatically when the app runs.
+# ------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# ------------------------------------------------------------------
+# Tests — not needed in the production/worker image
+# ------------------------------------------------------------------
+tests/
+
+# ------------------------------------------------------------------
+# Dev-only requirements (not needed inside any container)
+# ------------------------------------------------------------------
+requirements.dev.txt
+
+# ------------------------------------------------------------------
+# Local development files
+# ------------------------------------------------------------------
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+
+# ------------------------------------------------------------------
+# Node / frontend (if ever co-located)
+# ------------------------------------------------------------------
+node_modules/

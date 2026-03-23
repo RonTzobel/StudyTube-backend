@@ -3,56 +3,65 @@ from typing import List
 
 from sqlmodel import Session, select
 
+from app.config.settings import settings
 from app.models.chunk import TranscriptChunk
 
 
 # ---------------------------------------------------------------------------
-# Local embedding model — loaded once at module import time.
+# Embedding model — loaded once at module import time.
 #
-# Model: all-MiniLM-L6-v2
+# Model is configured via EMBEDDING_MODEL_NAME in settings / .env.
+# Current default: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
 #   - 384-dimensional vectors
-#   - ~80 MB download, cached in ~/.cache/torch/sentence_transformers
-#   - Runs on CPU; no GPU required
-#   - Optimised for semantic similarity — exactly what RAG retrieval needs
-#   - torch is already in the venv (pulled in by openai-whisper), so no
-#     extra heavyweight dependency is added
+#   - Trained on 50+ languages; strong Hebrew support
+#   - ~470 MB on disk; runs on CPU without a GPU
+#   - RAG thresholds in settings.py are calibrated for this model
 #
-# The model is loaded here (module level) so the ~1-2 second load cost
-# is paid once at startup, not on every embed request.
+# IMPORTANT — model compatibility:
+#   Chunk embeddings and query embeddings MUST use the same model.
+#   If you change EMBEDDING_MODEL_NAME, re-process every existing video
+#   (POST /api/v1/videos/{id}/transcribe) so old chunks are re-embedded.
+#   Mixing vectors from different models silently breaks cosine similarity.
 #
-# To swap to OpenAI embeddings later, delete the _model lines and replace
-# embed_text() with an openai.embeddings.create() call. Nothing else changes.
+# To swap to a different model: change EMBEDDING_MODEL_NAME in .env and
+# adjust RAG_LOW_THRESHOLD / RAG_GOOD_THRESHOLD in .env to match the new
+# model's typical score range.
 # ---------------------------------------------------------------------------
 
 try:
     from sentence_transformers import SentenceTransformer as _ST
-    _model = _ST("all-MiniLM-L6-v2")
+    _model = _ST(settings.EMBEDDING_MODEL_NAME)
+    _model_name = settings.EMBEDDING_MODEL_NAME
 except Exception:
-    # sentence-transformers not installed — server still starts, embed
-    # endpoint will raise a clear RuntimeError at call time.
+    # sentence-transformers not installed or model failed to load.
+    # The server still starts; embed_text() will raise a clear RuntimeError.
     _model = None
+    _model_name = None
 
 
 def embed_text(text: str) -> List[float]:
     """
-    Generate a 384-dimensional semantic embedding for a piece of text.
+    Generate a semantic embedding vector for a piece of text.
 
-    Uses the locally-running all-MiniLM-L6-v2 model via sentence-transformers.
-    No API key or network call is needed after the first run (model is cached).
+    Uses the model configured in settings.EMBEDDING_MODEL_NAME.
+    No API key or network call is needed after the first run (model is cached
+    in ~/.cache/torch/sentence_transformers).
 
     Args:
-        text: The chunk text to embed.
+        text: The text to embed (chunk content or user query).
 
     Returns:
-        A list of 384 floats representing the semantic embedding vector.
+        A list of floats representing the embedding vector.
+        Length is determined by the configured model (384 for the default).
 
     Raises:
-        RuntimeError: If sentence-transformers is not installed.
+        RuntimeError: If sentence-transformers is not installed or the model
+                      failed to load at startup.
     """
     if _model is None:
         raise RuntimeError(
-            "sentence-transformers is not installed. "
-            "Run: pip install sentence-transformers"
+            f"Embedding model '{settings.EMBEDDING_MODEL_NAME}' is not available. "
+            "Check that sentence-transformers is installed and the model name is correct."
         )
     vector = _model.encode(text, convert_to_numpy=True)
     return vector.tolist()

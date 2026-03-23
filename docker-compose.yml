@@ -1,0 +1,132 @@
+# ============================================================
+# StudyTube Backend — Docker Compose
+# ============================================================
+# Runs the complete local stack: db + redis + backend + worker.
+#
+# Quick-start:
+#   docker compose up --build          # build and start everything
+#   docker compose up -d               # start in background (after first build)
+#   docker compose down                # stop and remove containers
+#   docker compose logs -f backend     # stream backend logs
+#   docker compose logs -f worker      # stream worker logs
+#
+# Database:
+#   By default DATABASE_URL in .env points to Aiven (cloud Postgres).
+#   The local `db` service is provided for offline / CI use. To use it,
+#   override DATABASE_URL in .env:
+#     DATABASE_URL=postgresql+psycopg://studytube:studytube@db:5432/studytube
+#   The backend and worker reach the db container via the service name "db".
+#
+# Why run everything in Docker?
+#   - RQ worker requires os.fork() which is unavailable on Windows.
+#     Running inside a Linux container solves this completely.
+#   - Redis hostname inside containers must be the service name ("redis"),
+#     not "localhost". Docker Compose handles this automatically.
+#   - Consistent environment for all developers regardless of host OS.
+# ============================================================
+
+services:
+
+  # ----------------------------------------------------------
+  # PostgreSQL — local development database (optional)
+  # ----------------------------------------------------------
+  # Accessible from the host at localhost:5432.
+  # Backend and worker reach it at db:5432 via the Docker Compose
+  # service name when DATABASE_URL is set to point here.
+  # Data is persisted in the named volume `db_data`.
+  # ----------------------------------------------------------
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: studytube
+      POSTGRES_PASSWORD: studytube
+      POSTGRES_DB: studytube
+    ports:
+      - "5432:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U studytube"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ----------------------------------------------------------
+  # Redis — job queue broker
+  # ----------------------------------------------------------
+  # Accessible from the host at localhost:6379 (for debugging tools).
+  # Backend and worker reach it at redis://redis:6379/0 via the
+  # Docker Compose service name — this is overridden in environment:
+  # below and takes precedence over whatever REDIS_URL is in .env.
+  # ----------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ----------------------------------------------------------
+  # FastAPI backend — lightweight, no Whisper / CTranslate2
+  # ----------------------------------------------------------
+  # Built from Dockerfile.backend which installs only API dependencies
+  # (fastapi, auth, openai, sentence-transformers for query embedding).
+  # faster-whisper and ffmpeg are NOT present in this image.
+  #
+  # DATABASE_URL comes from .env (Aiven cloud by default).
+  # REDIS_URL is overridden so the backend reaches Redis via the
+  # Docker Compose service name, not localhost.
+  # ----------------------------------------------------------
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Override only the values that must differ inside Docker.
+      # Everything else (DATABASE_URL, SECRET_KEY, OPENAI_API_KEY, etc.)
+      # comes from .env unchanged.
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./uploads:/app/uploads
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # ----------------------------------------------------------
+  # RQ worker — executes video processing pipeline jobs
+  # ----------------------------------------------------------
+  # Built from Dockerfile.worker which installs AI/ML dependencies:
+  #   ffmpeg (system), faster-whisper, sentence-transformers, torch (CPU).
+  # Uses the same codebase as the backend but a heavier image.
+  #
+  # REDIS_URL overridden identically to the backend.
+  # Uploads volume mounted identically so the worker can read
+  # files uploaded by the backend (ffmpeg input path must resolve).
+  # ----------------------------------------------------------
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - ./uploads:/app/uploads
+    depends_on:
+      redis:
+        condition: service_healthy
+
+volumes:
+  db_data:

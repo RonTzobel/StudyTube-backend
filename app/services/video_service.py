@@ -54,38 +54,37 @@ def save_upload_file(upload_file: UploadFile, upload_dir: str) -> dict:
 def create_video_from_upload(
     session: Session,
     title: str,
-    file_path: str,
     user_id: int,
+    s3_key: str,
+    original_filename: str,
+    file_path: str | None = None,
 ) -> Video:
     """
-    Create a Video record in the database after a file has been saved to disk.
+    Persist a Video metadata row after the file has been stored in S3.
 
-    This is called by the upload endpoint once save_upload_file() succeeds.
-    It is intentionally separate from create_video() because the upload flow
-    receives a filename and a file path — not a VideoCreate schema.
+    The video binary is NOT stored here — only the s3_key that points to it.
 
     Args:
-        session:   The database session injected by FastAPI.
-        title:     The video title — defaults to the original filename for now.
-        file_path: The path where the file was saved on disk.
-        user_id:   The authenticated user's ID from the JWT token.
-                   Must be provided by the router — never a default.
+        session:           DB session injected by FastAPI.
+        title:             Display title (defaults to original filename).
+        user_id:           Owner — taken from the JWT, never the request body.
+        s3_key:            S3 object key returned by upload_file_to_s3().
+        original_filename: The filename as submitted by the uploader.
+        file_path:         Optional local path (kept for legacy / worker compat).
 
     Returns:
-        The newly created and database-refreshed Video object.
+        The newly created and DB-refreshed Video object.
     """
     video = Video(
         user_id=user_id,
         title=title,
+        original_filename=original_filename,
+        s3_key=s3_key,
         file_path=file_path,
         status="uploaded",
     )
-    # session.add() stages the object — it is not in the DB yet.
     session.add(video)
-    # session.commit() writes the INSERT to PostgreSQL and assigns the id.
     session.commit()
-    # session.refresh() re-reads the row so the returned object has
-    # the id and created_at values that PostgreSQL generated.
     session.refresh(video)
     return video
 
@@ -123,7 +122,7 @@ def update_video_status(session: Session, video: Video, status: str) -> None:
     """
     Update the processing status of a video and commit immediately.
 
-    Valid status values (by convention): uploaded → processing → done → failed
+    Valid status values: uploaded → queued → processing → transcribed → indexing → ready / failed
 
     This is called by the transcription endpoint to keep the video record
     in sync with what is actually happening to the file.

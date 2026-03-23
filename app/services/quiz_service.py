@@ -17,6 +17,7 @@ from typing import List
 from sqlmodel import Session
 
 from app.config.settings import settings
+from app.core.language import detect_language, language_instruction
 from app.models.chunk import TranscriptChunk
 from app.schemas.quiz import QuizQuestion, QuizResponse
 from app.services.retrieval_service import get_embedded_chunks
@@ -85,7 +86,7 @@ def _sample_chunks_evenly(
 # Prompt builder
 # ---------------------------------------------------------------------------
 
-_SYSTEM_MESSAGE = (
+_SYSTEM_MESSAGE_BASE = (
     "You are a quiz generator for a video learning platform. "
     "You will be given excerpts from a video transcript. "
     "Generate multiple-choice quiz questions based ONLY on the information "
@@ -98,16 +99,12 @@ _SYSTEM_MESSAGE = (
 )
 
 
-def _build_quiz_prompt(chunks: List[TranscriptChunk], num_questions: int) -> str:
+def _build_quiz_prompt(chunks: List[TranscriptChunk], num_questions: int, lang: str) -> str:
     """
     Build the user-turn message for quiz generation.
 
-    Args:
-        chunks:        Sampled transcript chunks to use as context.
-        num_questions: How many questions to ask the LLM to generate.
-
-    Returns:
-        A formatted prompt string.
+    lang is detected from the transcript chunks so the directive is based on
+    the lecture language, not a user question (there is none for quiz generation).
     """
     context_blocks = "\n\n".join(
         f"[Excerpt {i + 1}]\n{chunk.content}"
@@ -119,6 +116,9 @@ def _build_quiz_prompt(chunks: List[TranscriptChunk], num_questions: int) -> str
         f"{context_blocks}\n\n"
         f"Generate exactly {num_questions} multiple-choice questions based on "
         f"the excerpts above.\n\n"
+        f"{language_instruction(lang)}\n"
+        f"This applies to ALL parts of the output: question text, all answer "
+        f"options (A, B, C, D), and the correct_answer field.\n\n"
         f"Return your response as a JSON object in this exact format:\n"
         f'{{\n'
         f'  "questions": [\n'
@@ -229,15 +229,23 @@ def generate_quiz(
     # Step 2 — sample evenly for broad transcript coverage
     sampled = _sample_chunks_evenly(all_chunks, top_k)
 
-    # Step 3 — build the prompt
-    user_message = _build_quiz_prompt(sampled, num_questions)
+    # Detect language from the transcript content.
+    # There is no user question for quiz generation, so the transcript itself
+    # is the only language signal.
+    transcript_sample = " ".join(c.content for c in sampled)
+    lang = detect_language(transcript_sample)
 
-    # Step 4 — call OpenAI
+    # Step 3 — build the prompt with an explicit language directive
+    user_message = _build_quiz_prompt(sampled, num_questions, lang)
+
+    # Step 4 — call OpenAI; language instruction is also injected into the
+    # system message so it is reinforced at both the system and user levels.
+    system_message = f"{_SYSTEM_MESSAGE_BASE}\n{language_instruction(lang)}"
     client = _get_openai_client()
     response = client.chat.completions.create(
         model=model,
         messages=[
-            {"role": "system", "content": _SYSTEM_MESSAGE},
+            {"role": "system", "content": system_message},
             {"role": "user",   "content": user_message},
         ],
         temperature=0.4,          # slightly higher than /ask for question variety

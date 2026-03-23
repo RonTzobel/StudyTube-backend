@@ -59,13 +59,11 @@ app = FastAPI(
 )
 
 # --- CORS ---
-# Allow the Vite dev server (both localhost and 127.0.0.1 variants) to call the API.
+# Origins are controlled by CORS_ALLOWED_ORIGINS in .env so this list
+# never needs to be changed in source code across environments.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    ],
+    allow_origins=settings.CORS_ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],

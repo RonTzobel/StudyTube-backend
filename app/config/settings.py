@@ -21,6 +21,10 @@ class Settings(BaseSettings):
     APP_NAME: str = "StudyTube"
     DEBUG: bool = False
 
+    # Runtime environment — used for conditional behaviour and logging.
+    # Accepted values: "development" | "production" | "test"
+    ENV: str = "development"
+
     # --- Database ---
     # Full PostgreSQL connection string.
     # Example: postgresql://user:password@localhost:5432/studytube
@@ -31,20 +35,53 @@ class Settings(BaseSettings):
     # In production this would point to a cloud bucket or a mounted volume.
     UPLOAD_DIR: str = "uploads"
 
+    # --- AWS S3 ---
+    # Used for video file storage. Videos are never stored in PostgreSQL —
+    # only the S3 key (object path) is saved in the database.
+    #
+    # Required IAM permissions for the configured user:
+    #   s3:PutObject, s3:DeleteObject, s3:GetObject on arn:aws:s3:::{bucket}/*
+    AWS_ACCESS_KEY_ID: str = ""
+    AWS_SECRET_ACCESS_KEY: str = ""
+    AWS_REGION: str = ""
+    AWS_S3_BUCKET: str = ""
+
     # --- OpenAI ---
     # Required for the /ask endpoint (RAG answer generation).
     # Get your key at https://platform.openai.com/api-keys
     # Keep this out of version control — set it only in your .env file.
     OPENAI_API_KEY: str = ""
 
+    # --- Embedding model ---
+    #
+    # The sentence-transformers model used to embed transcript chunks and
+    # user queries. Both MUST use the same model — mixing models produces
+    # semantically incompatible vectors and silently breaks retrieval.
+    #
+    # Current default: paraphrase-multilingual-MiniLM-L12-v2
+    #   - 384-dimensional vectors (same storage format as the previous model)
+    #   - Trained on 50+ languages; strong Hebrew support
+    #   - ~470 MB on disk; runs on CPU
+    #   - Typical cosine scores for relevant Hebrew pairs: 0.40 – 0.80
+    #
+    # Previous model (English-biased): all-MiniLM-L6-v2
+    #   - 384-dimensional vectors
+    #   - Hebrew pairs scored 0.12 – 0.35 (30–50 % lower than English)
+    #   - ~80 MB on disk
+    #
+    # To switch models: change this value AND re-process all existing videos
+    # (POST /api/v1/videos/{id}/transcribe for each) so chunks are re-embedded
+    # with the new model. Do NOT mix chunk embeddings from different models.
+    EMBEDDING_MODEL_NAME: str = (
+        "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+    )
+
     # --- RAG quality gate (two-level policy) ---
     #
-    # We use two thresholds instead of one rigid cutoff because
-    # all-MiniLM-L6-v2 is English-optimised. When it encodes Hebrew text it
-    # still produces meaningful vectors, but scores are systematically
-    # 30–50 % lower than for equivalent English content.
-    # A relevant Hebrew question typically scores 0.12 – 0.35 (vs 0.40 – 0.75
-    # for English), so a single threshold of 0.30 rejects too many valid questions.
+    # Calibrated for paraphrase-multilingual-MiniLM-L12-v2.
+    # This model produces much higher cosine scores than the previous
+    # English-only model — relevant Hebrew pairs now score 0.40 – 0.80,
+    # so the old thresholds of 0.10 / 0.22 were far too low.
     #
     # Policy:
     #   best_score < RAG_LOW_THRESHOLD   → immediate fallback, no OpenAI call
@@ -58,8 +95,9 @@ class Settings(BaseSettings):
     #                                      confidence_level="high"
     #
     # Range for both values: 0.0 – 1.0
-    RAG_LOW_THRESHOLD: float = 0.10
-    RAG_GOOD_THRESHOLD: float = 0.22
+    # If you switch back to all-MiniLM-L6-v2, lower these to 0.10 / 0.22.
+    RAG_LOW_THRESHOLD: float = 0.20
+    RAG_GOOD_THRESHOLD: float = 0.40
 
     # --- Whisper transcription ---
     #
@@ -100,7 +138,28 @@ class Settings(BaseSettings):
     WHISPER_VAD_FILTER: bool = True
     WHISPER_CPU_THREADS: int = 0
 
-    # --- Security (placeholder for future JWT auth) ---
+    # --- CORS ---
+    # List of allowed origins for the frontend.
+    # pydantic-settings parses a JSON array string from the .env file:
+    #   CORS_ALLOWED_ORIGINS=["https://app.studytube.com"]
+    # Default covers both Vite dev-server variants for local development.
+    CORS_ALLOWED_ORIGINS: list[str] = [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ]
+
+    # --- Redis ---
+    # Local:  redis://localhost:6379/0
+    # Docker: redis://redis:6379/0  (matches the service name in docker-compose)
+    REDIS_URL: str = "redis://localhost:6379/0"
+
+    # --- Worker job timeouts ---
+    # Maximum wall-clock seconds a video pipeline job may run before RQ kills it.
+    # Default: 7200 (2 hours) — generous ceiling for a 90-min lecture on CPU.
+    # Increase if you process very long videos on slow hardware.
+    VIDEO_PIPELINE_JOB_TIMEOUT: int = 7200
+
+    # --- Security ---
     SECRET_KEY: str = "changeme"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 120
 

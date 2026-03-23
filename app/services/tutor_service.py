@@ -22,6 +22,7 @@ import json
 from sqlmodel import Session
 
 from app.config.settings import settings
+from app.core.language import detect_language, language_instruction
 from app.services.qa_service import answer_question
 from app.services.quiz_service import generate_quiz
 from app.services.retrieval_service import search_chunks
@@ -51,7 +52,7 @@ def _get_openai_client():
 # 1. summarize_video_for_study
 # ---------------------------------------------------------------------------
 
-_SUMMARY_SYSTEM = (
+_SUMMARY_SYSTEM_BASE = (
     "You are a study assistant that helps students learn from lecture transcripts. "
     "Read the provided transcript and produce a structured study summary. "
     "Return ONLY valid JSON with this exact format — no markdown, no extra text:\n"
@@ -88,11 +89,14 @@ def summarize_video_for_study(session: Session, video_id: int) -> dict:
             "Run transcription first."
         )
 
+    lang = detect_language(transcript.content)
+    system_message = f"{_SUMMARY_SYSTEM_BASE}\n{language_instruction(lang)}"
+
     client = _get_openai_client()
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
-            {"role": "system", "content": _SUMMARY_SYSTEM},
+            {"role": "system", "content": system_message},
             {"role": "user",   "content": f"Transcript:\n{transcript.content}"},
         ],
         temperature=0.3,

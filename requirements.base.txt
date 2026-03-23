@@ -1,0 +1,18 @@
+# ============================================================
+# requirements.base.txt — shared by backend API and worker
+# ============================================================
+# Both containers need these. Install this file via:
+#   -r requirements.base.txt
+# inside requirements.backend.txt and requirements.worker.txt.
+# ============================================================
+
+# --- Database ---
+sqlmodel==0.0.22          # SQLModel = SQLAlchemy + Pydantic in one
+psycopg[binary]==3.2.9    # PostgreSQL driver (v3, pre-built wheel, no pg_config needed)
+
+# --- Settings ---
+pydantic-settings==2.6.1  # Loads config from .env files
+
+# --- Job queue ---
+rq==1.16.2                # Redis Queue — worker/job system for background processing
+redis>=4.6.0              # Redis Python client (explicit — also a transitive dep of rq)

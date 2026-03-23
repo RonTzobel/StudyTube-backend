@@ -10,12 +10,15 @@ Ownership rules:
   - 403 : resource exists but belongs to a different user
 """
 
+import logging
 import os
 from pathlib import Path
 from typing import List
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Response, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, Response, UploadFile, File
 from sqlmodel import Session
+
+_log = logging.getLogger(__name__)
 
 from app.config.settings import settings
 from app.core.dependencies import get_current_user
@@ -28,7 +31,8 @@ from app.schemas.quiz import QuizRequest, QuizResponse
 from app.schemas.retrieval import RetrievedChunkRead, SearchChunksRequest
 from app.schemas.summary import SummaryRead
 from app.schemas.transcript import TranscriptRead
-from app.schemas.video import VideoRead, TranscribeAccepted
+from app.schemas.video import VideoRead, TranscribeAccepted, UploadResponse
+from app.services.s3_service import upload_file_to_s3, delete_file_from_s3
 from app.services.summary_service import (
     create_summary,
     generate_summary,
@@ -37,8 +41,12 @@ from app.services.summary_service import (
 from app.services.transcript_service import (
     get_transcript_by_video_id,
     get_video_by_id,
-    run_transcription_background,
 )
+from app.worker.redis_conn import default_queue
+
+# Job function referenced by dotted path so FastAPI never imports app.worker.jobs.
+# This keeps the Whisper model out of the API server process entirely.
+_PIPELINE_JOB = "app.worker.jobs.process_video_pipeline"
 from app.services.chunk_service import (
     chunks_exist_for_video,
     create_chunks,
@@ -53,7 +61,6 @@ from app.services.video_service import (
     create_video_from_upload,
     delete_video,
     get_videos_for_user,
-    save_upload_file,
     update_video_status,
 )
 
@@ -100,14 +107,14 @@ def _get_owned_video(session: Session, video_id: int, user_id: int) -> Video:
     return video
 
 
-_PIPELINE_IN_PROGRESS = {"processing", "transcribed", "indexing"}
+_PIPELINE_IN_PROGRESS = {"queued", "processing", "transcribed", "indexing"}
 
 
 def _require_ready(video: Video) -> None:
     """
     Raise an appropriate HTTP error if the video is not yet fully processed.
 
-    409  — pipeline is still running (processing / transcribed / indexing).
+    409  — pipeline is still running (queued / processing / transcribed / indexing).
     422  — pipeline failed or video has never been transcribed.
     """
     if video.status in _PIPELINE_IN_PROGRESS:
@@ -141,19 +148,19 @@ def _require_ready(video: Video) -> None:
 # Upload
 # ---------------------------------------------------------------------------
 
-@router.post("/upload", response_model=VideoRead)
+@router.post("/upload", response_model=UploadResponse, status_code=201)
 def upload_video(
     file: UploadFile = File(...),
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ):
     """
-    Accept a video file, save it to disk, and create an owned Video record.
+    Accept a video file, upload it to S3, and create an owned Video metadata row.
 
-    Ownership is derived exclusively from the authenticated JWT — the request
-    body never contains a user_id.
+    The video binary is stored in S3 — PostgreSQL receives only the S3 key.
+    Ownership is derived exclusively from the authenticated JWT.
     """
-    # Validate MIME type
+    # 1 — validate MIME type
     if file.content_type not in ALLOWED_CONTENT_TYPES:
         raise HTTPException(
             status_code=400,
@@ -163,7 +170,7 @@ def upload_video(
             ),
         )
 
-    # Validate file size without loading it into memory
+    # 2 — validate file size without buffering the whole file into memory
     file.file.seek(0, 2)
     file_size = file.file.tell()
     file.file.seek(0)
@@ -174,17 +181,38 @@ def upload_video(
             detail="File too large. Maximum allowed size is 500 MB.",
         )
 
-    # Save file to disk
-    result = save_upload_file(upload_file=file, upload_dir=settings.UPLOAD_DIR)
+    # 3 — upload to S3 (stream-upload, no disk write)
+    # If this fails, no DB row is created — the error surfaces to the caller.
+    try:
+        s3_key = upload_file_to_s3(file=file, user_id=current_user.id)
+    except Exception as exc:
+        _log.error("s3 upload error | user_id=%d | %s", current_user.id, exc)
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to upload the video to storage. Please try again.",
+        )
 
-    # Create DB record — ownership comes from the token, never from the request
+    # 4 — create the metadata row only after S3 confirms success
+    original_filename = file.filename or "untitled"
     video = create_video_from_upload(
         session=session,
-        title=file.filename or "untitled",
-        file_path=result["file_path"],
-        user_id=current_user.id,          # ← JWT identity, not request body
+        title=original_filename,
+        user_id=current_user.id,       # ← JWT identity, never from request body
+        s3_key=s3_key,
+        original_filename=original_filename,
     )
-    return video
+
+    _log.info(
+        "upload done | video_id=%d  user_id=%d  s3_key=%s",
+        video.id, current_user.id, s3_key,
+    )
+
+    return UploadResponse(
+        message="Video uploaded successfully. Call POST /transcribe to start processing.",
+        video_id=video.id,
+        s3_key=s3_key,
+        status=video.status,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +252,30 @@ def get_video(
     return _get_owned_video(session, video_id, current_user.id)
 
 
+@router.get("/{video_id}/status", response_model=VideoRead)
+def get_video_status(
+    video_id: int,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Return the current processing status of an owned video.
+
+    Lightweight polling endpoint — identical response shape to
+    GET /{video_id} so the frontend can use either.
+
+    Status values:
+      "uploaded"    → file saved, pipeline not yet started
+      "queued"      → job accepted by Redis, worker not yet picked it up
+      "processing"  → worker is extracting audio + running Whisper
+      "transcribed" → transcript saved, chunking about to start
+      "indexing"    → chunking / embedding in progress
+      "ready"       → all done; quiz, chat, and search are available
+      "failed"      → pipeline error (check worker logs)
+    """
+    return _get_owned_video(session, video_id, current_user.id)
+
+
 # ---------------------------------------------------------------------------
 # Transcript — read
 # ---------------------------------------------------------------------------
@@ -254,31 +306,36 @@ def get_transcript(
 @router.post("/{video_id}/transcribe", response_model=TranscribeAccepted)
 def transcribe_video(
     video_id: int,
-    background_tasks: BackgroundTasks,
     response: Response,
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ):
     """
-    Dispatch Whisper transcription for an owned video.
+    Enqueue the full video processing pipeline via Redis/RQ.
 
-    Returns 202 immediately — the full pipeline runs in the background.
+    Returns 202 immediately — a worker process picks up the job and runs:
+      ffmpeg extraction → Whisper transcription → chunking → embedding.
+
     Poll GET /api/v1/videos/{video_id} and check `status`:
-      "processing"  → extracting audio + running Whisper
-      "transcribed" → transcript done, chunking about to start
+      "queued"      → job accepted, waiting for a free worker
+      "processing"  → worker is extracting audio + running Whisper
+      "transcribed" → transcript saved, chunking about to start
       "indexing"    → chunking / embedding in progress
-      "ready"       → transcript + embeddings ready; all endpoints available
-      "failed"      → pipeline encountered an error (check server logs)
+      "ready"       → all done; all endpoints available
+      "failed"      → pipeline encountered an error (check worker logs)
 
     Returns 200 if the video is already ready (no new job is started).
-    Returns 409 if the pipeline is already running for this video.
+    Returns 409 if the pipeline is already queued or running.
     """
     video = _get_owned_video(session, video_id, current_user.id)
 
-    if not video.file_path or not Path(video.file_path).exists():
+    has_file = bool(video.s3_key) or (
+        bool(video.file_path) and Path(video.file_path).exists()
+    )
+    if not has_file:
         raise HTTPException(
             status_code=422,
-            detail=f"Video {video_id} has no file on disk. Upload the file first.",
+            detail=f"Video {video_id} has no accessible file. Upload the file first.",
         )
 
     # Already fully processed — nothing to do.
@@ -290,7 +347,7 @@ def transcribe_video(
             status="ready",
         )
 
-    # Already running — reject to avoid duplicate jobs.
+    # Already queued or running — reject to avoid duplicate jobs.
     if video.status in _PIPELINE_IN_PROGRESS:
         raise HTTPException(
             status_code=409,
@@ -301,21 +358,42 @@ def transcribe_video(
             ),
         )
 
-    # Mark as processing synchronously so the client sees the state
-    # change the instant the 202 is received, before the task even starts.
-    update_video_status(session, video, "processing")
+    # Enqueue FIRST — if Redis is unavailable, do NOT leave the video stuck
+    # in "queued" with no real job behind it (that would block all future
+    # retry attempts since "queued" is in _PIPELINE_IN_PROGRESS).
+    try:
+        default_queue.enqueue(
+            _PIPELINE_JOB,
+            video_id,
+            job_timeout=settings.VIDEO_PIPELINE_JOB_TIMEOUT,
+        )
+    except Exception as enqueue_exc:
+        _log.error(
+            "enqueue failed | video_id=%d | %s: %s",
+            video_id, type(enqueue_exc).__name__, enqueue_exc,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Failed to queue the processing job. "
+                "Redis may be unavailable — try again shortly."
+            ),
+        )
 
-    background_tasks.add_task(run_transcription_background, video_id)
+    # Job is confirmed in the queue — now persist the status change.
+    update_video_status(session, video, "queued")
+
+    _log.info("job enqueued | video_id=%d | timeout=%ds", video_id, settings.VIDEO_PIPELINE_JOB_TIMEOUT)
 
     response.status_code = 202
     return TranscribeAccepted(
         message=(
-            "Transcription started. "
+            "Job queued. "
             "Poll GET /api/v1/videos/{video_id} until status is 'ready', "
             "then fetch the transcript at GET /api/v1/videos/{video_id}/transcript."
         ),
         video_id=video_id,
-        status="processing",
+        status="queued",
     )
 
 
@@ -512,8 +590,11 @@ def delete_video_endpoint(
     """
     video = _get_owned_video(session, video_id, current_user.id)
 
-    # Remove the file from disk if it exists
-    if video.file_path:
+    # Remove the video file from wherever it lives.
+    # S3 (new uploads) and local disk (legacy) are both handled.
+    if video.s3_key:
+        delete_file_from_s3(video.s3_key)
+    elif video.file_path:
         file = Path(video.file_path)
         if file.exists():
             file.unlink()

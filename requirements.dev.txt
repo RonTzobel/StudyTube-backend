@@ -1,0 +1,15 @@
+# ============================================================
+# requirements.dev.txt — local development (NOT used in Docker)
+# ============================================================
+# Installs everything: backend + worker + test tooling.
+# Use this for local venv setup:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   pip install -r requirements.dev.txt
+# ============================================================
+
+-r requirements.backend.txt
+-r requirements.worker.txt
+
+# --- Testing ---
+pytest==8.3.4
+httpx==0.28.1  # Required by FastAPI's TestClient

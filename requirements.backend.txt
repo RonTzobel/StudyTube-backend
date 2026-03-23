@@ -1,0 +1,38 @@
+# ============================================================
+# requirements.backend.txt — FastAPI backend container
+# ============================================================
+# Installed in Dockerfile.backend. Does NOT include:
+#   - faster-whisper / ctranslate2  (Whisper inference, worker only)
+#   - ffmpeg                        (system package, worker only)
+#
+# sentence-transformers IS included here because the backend embeds
+# search queries at request time for /search and /ask (RAG). The model
+# runs on CPU; torch is installed with the CPU-only wheel in Dockerfile.backend
+# to avoid pulling CUDA/NVIDIA packages.
+# ============================================================
+
+-r requirements.base.txt
+
+# --- Web framework ---
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+
+# --- File uploads (required by FastAPI for UploadFile / Form) ---
+python-multipart==0.0.12
+
+# --- Database migrations ---
+alembic==1.14.0
+
+# --- Auth ---
+passlib[bcrypt]==1.7.4           # Password hashing
+python-jose[cryptography]==3.3.0 # JWT tokens
+email-validator==2.2.0           # Enables pydantic EmailStr validation
+
+# --- OpenAI (required for /ask, /quiz, /summarize, tutor endpoints) ---
+openai>=1.0.0
+
+# --- Query embeddings for RAG (/search and /ask) ---
+# torch is installed separately in Dockerfile.backend with --index-url
+# https://download.pytorch.org/whl/cpu to guarantee the CPU-only wheel.
+sentence-transformers
+boto3

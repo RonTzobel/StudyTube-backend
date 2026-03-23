@@ -1,25 +1,13 @@
-# --- Web framework ---
-fastapi==0.115.5
-uvicorn[standard]==0.32.1
+# ============================================================
+# requirements.txt — convenience pointer for local development
+# ============================================================
+# In Docker, containers use the split files directly:
+#   Dockerfile.backend  → requirements.backend.txt
+#   Dockerfile.worker   → requirements.worker.txt
+#
+# For local venv setup install torch first (CPU-only), then this file:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   pip install -r requirements.txt
+# ============================================================
 
-# --- Database ---
-sqlmodel==0.0.22          # SQLModel = SQLAlchemy + Pydantic in one
-psycopg[binary]==3.2.9    # PostgreSQL driver (v3, pre-built wheel, no pg_config needed)
-alembic==1.14.0           # Database migration tool (for future use)
-
-# --- Settings ---
-pydantic-settings==2.6.1  # Loads config from .env files
-
-# --- Auth (placeholders — will be used when auth is implemented) ---
-passlib[bcrypt]==1.7.4    # Password hashing
-python-jose[cryptography]==3.3.0  # JWT tokens
-
-# --- Validation ---
-email-validator==2.2.0    # Enables pydantic EmailStr validation
-
-# --- Transcription ---
-openai-whisper            # OpenAI Whisper speech-to-text (pins its own torch/numpy deps)
-
-# --- Testing ---
-pytest==8.3.4
-httpx==0.28.1             # Required by FastAPI's TestClient
+-r requirements.dev.txt

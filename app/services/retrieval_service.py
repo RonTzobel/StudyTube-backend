@@ -24,8 +24,8 @@ from app.services.embedding_service import embed_text
 #   cosine_similarity(A, B) = (A · B) / (|A| × |B|)
 #
 # We implement this in pure Python so no extra dependency is needed.
-# numpy would be faster but the vectors are only 384 floats — pure Python
-# is fast enough and keeps the dependency list short.
+# numpy would be faster but vectors are small (e.g. 384 floats) — pure Python
+# is fast enough here and keeps the dependency list short.
 # ---------------------------------------------------------------------------
 
 def _cosine_similarity(a: List[float], b: List[float]) -> float:

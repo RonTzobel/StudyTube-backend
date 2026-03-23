@@ -1,0 +1,26 @@
+# ============================================================
+# requirements.worker.txt — RQ worker container
+# ============================================================
+# Installed in Dockerfile.worker. Includes all AI/ML dependencies
+# needed for the video processing pipeline:
+#   ffmpeg → faster-whisper → chunking → sentence-transformers
+#
+# torch is installed separately in Dockerfile.worker with --index-url
+# https://download.pytorch.org/whl/cpu to guarantee the CPU-only wheel
+# (avoids downloading multi-GB CUDA/NVIDIA packages for local dev).
+# ============================================================
+
+-r requirements.base.txt
+
+# --- AWS S3 (for downloading videos before ffmpeg processing) ---
+boto3
+
+# --- Transcription ---
+# faster-whisper uses CTranslate2 (NOT torch) for inference — CPU-friendly
+# and significantly faster than openai-whisper for the same model size.
+faster-whisper
+
+# --- Chunk embeddings ---
+# sentence-transformers uses torch (CPU wheel, installed first in Dockerfile).
+# The worker embeds transcript chunks during the processing pipeline.
+sentence-transformers

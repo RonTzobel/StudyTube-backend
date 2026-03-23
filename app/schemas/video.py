@@ -15,17 +15,27 @@ class VideoRead(BaseModel):
     What the API returns when representing a video.
 
     Intentionally omits:
-      - user_id   : internal FK, the authenticated client already knows who they are
-      - file_path : server-side filesystem path, must never be exposed to clients
+      - user_id   : internal FK, the client already knows who they are
+      - file_path : server-side path, must never be exposed to clients
     """
     id: int
     title: str
     description: Optional[str]
+    original_filename: Optional[str]
+    s3_key: Optional[str]
     status: str
     created_at: datetime
 
     class Config:
         from_attributes = True
+
+
+class UploadResponse(BaseModel):
+    """Returned by POST /upload after a successful S3 upload."""
+    message: str
+    video_id: int
+    s3_key: str
+    status: str
 
 
 class VideoUpdate(BaseModel):

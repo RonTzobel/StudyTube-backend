@@ -11,7 +11,13 @@ elif _url.startswith("postgres://") and "+" not in _url.split(":", 1)[0]:
 
 # create_engine sets up the connection pool to PostgreSQL.
 # echo=True logs every SQL query — useful during development, turn off in production.
-engine = create_engine(_url, echo=settings.DEBUG)
+#
+# pool_pre_ping=True: before reusing a pooled connection, SQLAlchemy issues a
+# lightweight "SELECT 1" to confirm it is still alive.  Without this, Aiven's
+# server-side idle-connection timeout can silently kill pooled connections; the
+# next query then raises OperationalError, which is uncaught in the auth chain
+# and surfaces as an unexpected HTTP 500 on endpoints like GET /auth/me.
+engine = create_engine(_url, echo=settings.DEBUG, pool_pre_ping=True)
 
 
 def create_db_and_tables() -> None:
