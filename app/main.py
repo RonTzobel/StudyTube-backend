@@ -43,6 +43,10 @@ async def lifespan(app: FastAPI):
 
     Startup:
       1. Create database tables (if they don't exist yet).
+         NOTE: create_db_and_tables() only creates NEW tables — it never alters
+         existing ones. Schema changes to existing tables (add/drop columns,
+         indexes, constraints) must be handled by Alembic migrations.
+         Run `alembic upgrade head` before starting the app in production.
       2. Seed the placeholder user so foreign keys work before auth is live.
     """
     create_db_and_tables()

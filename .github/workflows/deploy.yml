@@ -26,5 +26,7 @@ jobs:
           cd ~/StudyTube-backend
           git pull
           docker compose down
-          docker compose up -d --build
+          docker compose build
+          docker compose run --rm --no-deps backend alembic upgrade head
+          docker compose up -d
           EOF
