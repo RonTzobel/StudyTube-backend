@@ -24,13 +24,13 @@ class RegisterRequest(BaseModel):
     @field_validator("password")
     @classmethod
     def password_fits_bcrypt(cls, v: str) -> str:
-        byte_len = len(v.encode("utf-8"))
-        if byte_len > _BCRYPT_MAX_BYTES:
-            raise ValueError(
-                f"Password must not exceed {_BCRYPT_MAX_BYTES} bytes when "
-                f"encoded as UTF-8 (bcrypt limit). "
-                f"Your password is {byte_len} bytes."
-            )
+        # bcrypt operates on bytes and rejects inputs longer than 72 bytes.
+        # We check encoded byte length — not character length — because a
+        # single Unicode character can be up to 4 bytes in UTF-8.
+        # The user-facing message is intentionally generic: there is no reason
+        # to tell clients about the 72-byte bcrypt internals.
+        if len(v.encode("utf-8")) > _BCRYPT_MAX_BYTES:
+            raise ValueError("Password is too long. Please choose a shorter password.")
         return v
 
 

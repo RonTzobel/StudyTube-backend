@@ -108,6 +108,10 @@ def test_register_password_73_ascii_bytes():
     errors = response.json()["detail"]
     # Pydantic v2 loc format: ["body", "password"]
     assert any("password" in str(e.get("loc", "")) for e in errors)
+    # Error message must be user-friendly — bcrypt internals must not be exposed
+    messages = " ".join(str(e.get("msg", "")) for e in errors).lower()
+    assert "too long" in messages
+    assert "72" not in messages
 
 
 def test_register_password_too_long_multibyte():
