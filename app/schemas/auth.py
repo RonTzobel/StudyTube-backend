@@ -5,7 +5,14 @@ Kept separate from app/schemas/user.py because the auth API shapes
 differ from the generic user CRUD shapes.
 """
 
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, field_validator
+
+# bcrypt silently truncates passwords longer than 72 bytes, which is a security
+# risk (two different passwords can produce the same hash). passlib raises
+# ValueError before hashing when the limit is exceeded — which is the 500 we
+# are preventing here. Validation must use byte length, not character length,
+# because a single Unicode character can be up to 4 bytes in UTF-8.
+_BCRYPT_MAX_BYTES = 72
 
 
 class RegisterRequest(BaseModel):
@@ -13,6 +20,18 @@ class RegisterRequest(BaseModel):
     full_name: str          # stored as username in the User table
     email: EmailStr
     password: str
+
+    @field_validator("password")
+    @classmethod
+    def password_fits_bcrypt(cls, v: str) -> str:
+        byte_len = len(v.encode("utf-8"))
+        if byte_len > _BCRYPT_MAX_BYTES:
+            raise ValueError(
+                f"Password must not exceed {_BCRYPT_MAX_BYTES} bytes when "
+                f"encoded as UTF-8 (bcrypt limit). "
+                f"Your password is {byte_len} bytes."
+            )
+        return v
 
 
 class LoginRequest(BaseModel):
