@@ -75,11 +75,12 @@ class Settings(BaseSettings):
     RAG_GOOD_THRESHOLD: float = 0.60
 
     # --- Whisper transcription ---
-    # small.en: safe default for EC2 CPU deployments.
-    # medium.en is more accurate but uses ~2.5× more RAM (~2.6 GB vs ~1.0 GB
-    # peak during decode) and gets OOM-killed on long videos (signal 9).
-    # Override with WHISPER_MODEL=medium.en in .env once you have more RAM.
-    WHISPER_MODEL: str = "small.en"
+    # base.en: lightest stable model for CPU-only Docker/EC2 deployments.
+    # small.en stalls at near-zero CPU on constrained instances (CTranslate2
+    # thread scheduling issue even with cpu_threads=2). base.en is ~2× lighter
+    # and reliably completes inference. Upgrade to small.en or medium.en once
+    # the instance has more headroom or chunked streaming is implemented.
+    WHISPER_MODEL: str = "base.en"
     WHISPER_LANGUAGE: str = "en"
     WHISPER_DEVICE: str = "cpu"
     WHISPER_COMPUTE_TYPE: str = "int8"
