@@ -138,12 +138,75 @@ def _extract_audio(video_path: str) -> str:
     return audio_path
 
 
+# Duration of each audio segment sent to Whisper (seconds).
+# 5 minutes keeps peak RAM well within safe limits for small.en on CPU EC2.
+# Raise to 600 if you upgrade to a memory-optimised instance.
+_CHUNK_SECONDS = 300
+
+
+def _split_audio_into_chunks(audio_path: str) -> List[str]:
+    """
+    Split a WAV file into fixed-length segments using ffmpeg.
+
+    Segments are written to a temp directory as chunk_000.wav, chunk_001.wav …
+    The CALLER is responsible for deleting all returned paths (use try/finally).
+
+    Args:
+        audio_path: Path to the full mono 16 kHz WAV produced by _extract_audio.
+
+    Returns:
+        Sorted list of absolute paths to the segment WAV files.
+
+    Raises:
+        RuntimeError: If ffmpeg exits with a non-zero return code.
+    """
+    chunk_dir = tempfile.mkdtemp(prefix="whisper_chunks_")
+    pattern = os.path.join(chunk_dir, "chunk_%03d.wav")
+
+    result = subprocess.run(
+        [
+            "ffmpeg", "-y",
+            "-i", audio_path,
+            "-f", "segment",
+            "-segment_time", str(_CHUNK_SECONDS),
+            "-c", "copy",
+            pattern,
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    if result.returncode != 0:
+        stderr_text = result.stderr.decode(errors="replace")
+        raise RuntimeError(
+            f"ffmpeg audio segmentation failed (exit={result.returncode}).\n"
+            f"stderr: {stderr_text[:1000]}"
+        )
+
+    chunks = sorted(
+        os.path.join(chunk_dir, f)
+        for f in os.listdir(chunk_dir)
+        if f.endswith(".wav")
+    )
+    _log.info(
+        "audio_split | %d chunks of %ds | dir=%s",
+        len(chunks),
+        _CHUNK_SECONDS,
+        chunk_dir,
+    )
+    return chunks
+
+
 def _transcribe_audio(audio_path: str) -> str:
     """
-    Transcribe a WAV file using faster-whisper.
+    Transcribe a WAV file using faster-whisper, processing it in fixed-length
+    segments to avoid OOM kills on long audio.
 
-    Language is read from settings.WHISPER_LANGUAGE (default: "en").
-    Beam size and VAD filter are read from settings.
+    The full WAV is split into _CHUNK_SECONDS-long pieces with ffmpeg, each
+    piece is transcribed independently, and the results are joined into one
+    string. This keeps Whisper's peak memory constant regardless of video length.
+
+    Language, beam_size, and vad_filter are read from settings.
 
     Returns:
         Full transcript as a single stripped string.
@@ -158,28 +221,61 @@ def _transcribe_audio(audio_path: str) -> str:
         )
 
     _log.info(
-        "transcribe | start | lang=%s model=%s beam_size=%d vad=%s",
+        "transcribe | start | lang=%s model=%s beam_size=%d vad=%s chunk_s=%d",
         settings.WHISPER_LANGUAGE,
         settings.WHISPER_MODEL,
         settings.WHISPER_BEAM_SIZE,
         settings.WHISPER_VAD_FILTER,
+        _CHUNK_SECONDS,
     )
-    t0 = time.monotonic()
+    t_total = time.monotonic()
 
-    segments, info = _whisper_model.transcribe(
-        audio_path,
-        language=settings.WHISPER_LANGUAGE,
-        task="transcribe",
-        beam_size=settings.WHISPER_BEAM_SIZE,
-        vad_filter=settings.WHISPER_VAD_FILTER,
-    )
-    text = " ".join(seg.text.strip() for seg in segments).strip()
+    chunk_paths = _split_audio_into_chunks(audio_path)
+    chunk_texts: List[str] = []
 
+    try:
+        for i, chunk_path in enumerate(chunk_paths):
+            t_chunk = time.monotonic()
+            _log.info(
+                "transcribe | chunk start | %d/%d | path=%s",
+                i + 1,
+                len(chunk_paths),
+                chunk_path,
+            )
+
+            segments, _info = _whisper_model.transcribe(
+                chunk_path,
+                language=settings.WHISPER_LANGUAGE,
+                task="transcribe",
+                beam_size=settings.WHISPER_BEAM_SIZE,
+                vad_filter=settings.WHISPER_VAD_FILTER,
+            )
+            chunk_text = " ".join(seg.text.strip() for seg in segments).strip()
+            chunk_texts.append(chunk_text)
+
+            _log.info(
+                "transcribe | chunk done | %d/%d | chars=%d elapsed=%.1fs",
+                i + 1,
+                len(chunk_paths),
+                len(chunk_text),
+                time.monotonic() - t_chunk,
+            )
+    finally:
+        # Always delete temp chunk files, even if a chunk fails mid-way.
+        for p in chunk_paths:
+            if os.path.exists(p):
+                os.remove(p)
+        # Remove the temp directory (now empty).
+        chunk_dir = os.path.dirname(chunk_paths[0]) if chunk_paths else None
+        if chunk_dir and os.path.isdir(chunk_dir):
+            os.rmdir(chunk_dir)
+
+    text = " ".join(t for t in chunk_texts if t).strip()
     _log.info(
-        "transcribe | done | detected_lang=%s chars=%d elapsed=%.1fs",
-        getattr(info, "language", "unknown"),
+        "transcribe | merged | chunks=%d total_chars=%d elapsed=%.1fs",
+        len(chunk_paths),
         len(text),
-        time.monotonic() - t0,
+        time.monotonic() - t_total,
     )
     return text
 
