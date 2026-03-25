@@ -185,12 +185,12 @@ def send_chat_message(
     # Lecture mode requires embeddings — check video is fully ready.
     if question_mode == "lecture":
         video = get_video_by_id(db, chat_session.video_id)
-        if video is not None and video.status != "ready":
+        if video is not None and video.status != "completed":
             status = video.status
-            if status in {"processing", "transcribed", "indexing"}:
+            if status in {"processing", "transcribing", "embedding", "queued"}:
                 raise ValueError(
                     f"Video {chat_session.video_id} is still being processed "
-                    f"(status='{status}'). Try again once status is 'ready'."
+                    f"(status='{status}'). Try again once status is 'completed'."
                 )
             raise ValueError(
                 f"Video {chat_session.video_id} is not ready "

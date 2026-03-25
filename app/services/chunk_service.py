@@ -84,8 +84,8 @@ def _split_into_sentence_units(text: str) -> List[str]:
 
 def split_into_chunks(
     text: str,
-    target_words: int = 400,
-    overlap_words: int = 75,
+    target_words: int = 800,
+    overlap_words: int = 120,
 ) -> List[dict]:
     """
     Split a transcript into sentence-aware overlapping chunks.
@@ -109,9 +109,9 @@ def split_into_chunks(
       consistent semantic density across both languages. The old 500-char
       limit was ~75–100 words — far too small for coherent lecture chunks.
 
-    Target parameters (calibrated for lecture Q&A):
-      target_words  = 400  →  ~2 000–2 500 chars; holds one full idea
-      overlap_words =  75  →  ~400 chars; keeps boundary context in both chunks
+    Target parameters (calibrated for English lecture Q&A):
+      target_words  = 800  →  ~4 000–5 000 chars; holds one full lecture idea
+      overlap_words = 120  →  ~600 chars; keeps boundary context in both chunks
 
     Args:
         text:          The full transcript string.
@@ -251,7 +251,7 @@ def delete_chunks_for_video(session: Session, video_id: int) -> int:
     Returns the number of rows deleted.
 
     Called by the pipeline before re-creating chunks so that a retry
-    after a failed "indexing" stage does not produce duplicate rows.
+    after a failed "embedding" stage does not produce duplicate rows.
     Embeddings are stored as columns on TranscriptChunk, so deleting
     the chunks implicitly clears the embeddings too.
     """

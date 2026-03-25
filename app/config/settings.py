@@ -57,19 +57,33 @@ class Settings(BaseSettings):
     # The sentence-transformers model used to embed transcript chunks and
     # user queries. Both MUST use the same model — mixing models produces
     # semantically incompatible vectors and silently breaks retrieval.
-    EMBEDDING_MODEL_NAME: str = (
-        "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-    )
+    #
+    # BAAI/bge-small-en-v1.5: strong English retrieval, 384-dim, fast on CPU.
+    # Good balance of quality vs. memory for EC2 CPU deployments.
+    # Swap to paraphrase-multilingual-MiniLM-L12-v2 for Hebrew/multilingual.
+    #
+    # If you change this model, re-index all existing videos — old and new
+    # vectors are geometrically incompatible and will silently break search.
+    EMBEDDING_MODEL_NAME: str = "BAAI/bge-small-en-v1.5"
 
     # --- RAG quality gate (two-level policy) ---
-    RAG_LOW_THRESHOLD: float = 0.20
-    RAG_GOOD_THRESHOLD: float = 0.40
+    # Calibrated for BAAI/bge-small-en-v1.5 cosine similarity score range.
+    # Below LOW  → immediate fallback, no OpenAI call (not enough context)
+    # Above GOOD → high-confidence answer
+    # Between   → borderline (OpenAI called with wider chunk window)
+    RAG_LOW_THRESHOLD: float = 0.30
+    RAG_GOOD_THRESHOLD: float = 0.60
 
     # --- Whisper transcription ---
-    WHISPER_MODEL: str = "small"
+    # medium.en is ~2× slower than small but meaningfully more accurate for
+    # English; the .en suffix forces English-only decoding (faster, no LID).
+    WHISPER_MODEL: str = "medium.en"
+    WHISPER_LANGUAGE: str = "en"
     WHISPER_DEVICE: str = "cpu"
     WHISPER_COMPUTE_TYPE: str = "int8"
-    WHISPER_BEAM_SIZE: int = 1
+    # beam_size=5: full beam search — better accuracy at the cost of ~3×
+    # the decode time vs. beam_size=1 (greedy). Acceptable on c7i-flex.large.
+    WHISPER_BEAM_SIZE: int = 5
     WHISPER_VAD_FILTER: bool = True
     WHISPER_CPU_THREADS: int = 0
 

@@ -11,10 +11,10 @@ from app.models.chunk import TranscriptChunk
 # Embedding model — loaded once at module import time.
 #
 # Model is configured via EMBEDDING_MODEL_NAME in settings / .env.
-# Current default: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+# Current default: BAAI/bge-small-en-v1.5
 #   - 384-dimensional vectors
-#   - Trained on 50+ languages; strong Hebrew support
-#   - ~470 MB on disk; runs on CPU without a GPU
+#   - Strong English semantic retrieval; MTEB top performer at this size
+#   - ~130 MB on disk; fast on CPU
 #   - RAG thresholds in settings.py are calibrated for this model
 #
 # IMPORTANT — model compatibility:

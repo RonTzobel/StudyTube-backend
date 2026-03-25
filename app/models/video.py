@@ -8,9 +8,14 @@ class Video(SQLModel, table=True):
     """
     Represents a video uploaded by a user.
 
-    At this stage we only store basic metadata.
-    Future additions: file storage path/URL, duration, processing status,
-    embeddings reference, language, etc.
+    Processing status lifecycle:
+        uploaded    → file accepted, pipeline not started
+        queued      → job sent to Redis, worker hasn't picked it up yet
+        processing  → worker is extracting audio with ffmpeg
+        transcribing → worker is running Whisper transcription
+        embedding   → worker is chunking + generating embeddings
+        completed   → fully processed; search, quiz, and ask are available
+        failed      → pipeline error; see error_message for details
     """
 
     __tablename__ = "videos"
@@ -27,7 +32,6 @@ class Video(SQLModel, table=True):
     original_filename: Optional[str] = Field(default=None)
 
     # S3 object key, e.g. "videos/7/abc123.mp4".
-    # This is the canonical reference to the video file.
     # The bucket name and region come from settings — never stored here.
     s3_key: Optional[str] = Field(default=None)
 
@@ -35,7 +39,11 @@ class Video(SQLModel, table=True):
     # uploaded before S3 migration, and as a temp path during worker processing.
     file_path: Optional[str] = Field(default=None)
 
-    # Processing states: uploaded → queued → processing → transcribed → indexing → ready | failed
+    # Current pipeline status — see docstring above for valid values.
     status: str = Field(default="uploaded")
+
+    # Human-readable description of the last pipeline failure.
+    # Populated by the worker on exception; None on success or before first run.
+    error_message: Optional[str] = Field(default=None)
 
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

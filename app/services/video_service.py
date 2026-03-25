@@ -122,7 +122,7 @@ def update_video_status(session: Session, video: Video, status: str) -> None:
     """
     Update the processing status of a video and commit immediately.
 
-    Valid status values: uploaded → queued → processing → transcribed → indexing → ready / failed
+    Valid status values: uploaded → queued → processing → transcribing → embedding → completed | failed
 
     This is called by the transcription endpoint to keep the video record
     in sync with what is actually happening to the file.

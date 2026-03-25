@@ -107,14 +107,14 @@ def _get_owned_video(session: Session, video_id: int, user_id: int) -> Video:
     return video
 
 
-_PIPELINE_IN_PROGRESS = {"queued", "processing", "transcribed", "indexing"}
+_PIPELINE_IN_PROGRESS = {"queued", "processing", "transcribing", "embedding"}
 
 
 def _require_ready(video: Video) -> None:
     """
     Raise an appropriate HTTP error if the video is not yet fully processed.
 
-    409  — pipeline is still running (queued / processing / transcribed / indexing).
+    409  — pipeline is still running (queued / processing / transcribing / embedding).
     422  — pipeline failed or video has never been transcribed.
     """
     if video.status in _PIPELINE_IN_PROGRESS:
@@ -123,7 +123,7 @@ def _require_ready(video: Video) -> None:
             detail=(
                 f"Video {video.id} is still being processed "
                 f"(status='{video.status}'). "
-                "Poll GET /api/v1/videos/{video_id} until status is 'ready'."
+                "Poll GET /api/v1/videos/{video_id} until status is 'completed'."
             ),
         )
     if video.status == "failed":
@@ -134,7 +134,7 @@ def _require_ready(video: Video) -> None:
                 "Re-upload and transcribe to try again."
             ),
         )
-    if video.status != "ready":
+    if video.status != "completed":
         raise HTTPException(
             status_code=422,
             detail=(
@@ -247,7 +247,7 @@ def get_video(
     Return a single owned video by ID.
 
     Intended for status polling after POST /transcribe:
-    call this endpoint repeatedly until `status` is "ready" or "failed".
+    call this endpoint repeatedly until `status` is "completed" or "failed".
     """
     return _get_owned_video(session, video_id, current_user.id)
 
@@ -265,13 +265,13 @@ def get_video_status(
     GET /{video_id} so the frontend can use either.
 
     Status values:
-      "uploaded"    → file saved, pipeline not yet started
-      "queued"      → job accepted by Redis, worker not yet picked it up
-      "processing"  → worker is extracting audio + running Whisper
-      "transcribed" → transcript saved, chunking about to start
-      "indexing"    → chunking / embedding in progress
-      "ready"       → all done; quiz, chat, and search are available
-      "failed"      → pipeline error (check worker logs)
+      "uploaded"     → file saved, pipeline not yet started
+      "queued"       → job accepted by Redis, worker not yet picked it up
+      "processing"   → worker extracting audio with ffmpeg
+      "transcribing" → worker running Whisper transcription
+      "embedding"    → chunking / embedding in progress
+      "completed"    → all done; quiz, chat, and search are available
+      "failed"       → pipeline error (see error_message field)
     """
     return _get_owned_video(session, video_id, current_user.id)
 
@@ -317,12 +317,12 @@ def transcribe_video(
       ffmpeg extraction → Whisper transcription → chunking → embedding.
 
     Poll GET /api/v1/videos/{video_id} and check `status`:
-      "queued"      → job accepted, waiting for a free worker
-      "processing"  → worker is extracting audio + running Whisper
-      "transcribed" → transcript saved, chunking about to start
-      "indexing"    → chunking / embedding in progress
-      "ready"       → all done; all endpoints available
-      "failed"      → pipeline encountered an error (check worker logs)
+      "queued"       → job accepted, waiting for a free worker
+      "processing"   → worker extracting audio with ffmpeg
+      "transcribing" → worker running Whisper transcription
+      "embedding"    → chunking / embedding in progress
+      "completed"    → all done; all endpoints available
+      "failed"       → pipeline error (see error_message field)
 
     Returns 200 if the video is already ready (no new job is started).
     Returns 409 if the pipeline is already queued or running.
@@ -339,12 +339,12 @@ def transcribe_video(
         )
 
     # Already fully processed — nothing to do.
-    if video.status == "ready":
+    if video.status == "completed":
         response.status_code = 200
         return TranscribeAccepted(
-            message="Video is already ready. Fetch the transcript at GET /transcript.",
+            message="Video is already processed. Fetch the transcript at GET /transcript.",
             video_id=video_id,
-            status="ready",
+            status="completed",
         )
 
     # Already queued or running — reject to avoid duplicate jobs.

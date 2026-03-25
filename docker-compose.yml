@@ -118,6 +118,7 @@ services:
       context: .
       dockerfile: Dockerfile.worker
     restart: unless-stopped
+    command: python worker.py
     env_file:
       - .env
     environment:
