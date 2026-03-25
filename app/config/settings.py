@@ -75,9 +75,11 @@ class Settings(BaseSettings):
     RAG_GOOD_THRESHOLD: float = 0.60
 
     # --- Whisper transcription ---
-    # medium.en is ~2× slower than small but meaningfully more accurate for
-    # English; the .en suffix forces English-only decoding (faster, no LID).
-    WHISPER_MODEL: str = "medium.en"
+    # small.en: safe default for EC2 CPU deployments.
+    # medium.en is more accurate but uses ~2.5× more RAM (~2.6 GB vs ~1.0 GB
+    # peak during decode) and gets OOM-killed on long videos (signal 9).
+    # Override with WHISPER_MODEL=medium.en in .env once you have more RAM.
+    WHISPER_MODEL: str = "small.en"
     WHISPER_LANGUAGE: str = "en"
     WHISPER_DEVICE: str = "cpu"
     WHISPER_COMPUTE_TYPE: str = "int8"
