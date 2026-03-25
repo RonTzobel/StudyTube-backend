@@ -83,9 +83,10 @@ class Settings(BaseSettings):
     WHISPER_LANGUAGE: str = "en"
     WHISPER_DEVICE: str = "cpu"
     WHISPER_COMPUTE_TYPE: str = "int8"
-    # beam_size=5: full beam search — better accuracy at the cost of ~3×
-    # the decode time vs. beam_size=1 (greedy). Acceptable on c7i-flex.large.
-    WHISPER_BEAM_SIZE: int = 5
+    # beam_size=1: greedy decode — uses ~3× less RAM than beam_size=5 and
+    # avoids OOM kills on long videos. Raise back to 5 only after adding
+    # chunked transcription or moving to a larger instance.
+    WHISPER_BEAM_SIZE: int = 1
     WHISPER_VAD_FILTER: bool = True
     WHISPER_CPU_THREADS: int = 0
 
