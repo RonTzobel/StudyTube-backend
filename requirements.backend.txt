@@ -25,6 +25,14 @@ alembic==1.14.0
 
 # --- Auth ---
 passlib[bcrypt]==1.7.4           # Password hashing
+bcrypt==4.0.1                    # Pinned: passlib 1.7.4 is incompatible with bcrypt>=4.1.x.
+                                 # Without this pin, Docker resolves the latest bcrypt (4.2+),
+                                 # which removes bcrypt.__about__ and breaks passlib's backend
+                                 # initialisation with AttributeError. 4.0.1 is the minimum
+                                 # 4.x release where passlib still works; its __about__ warning
+                                 # is caught internally by passlib and is non-fatal.
+                                 # Local venv had 3.2.2 — this is why registration worked
+                                 # locally but failed in Docker.
 python-jose[cryptography]==3.3.0 # JWT tokens
 email-validator==2.2.0           # Enables pydantic EmailStr validation
 
