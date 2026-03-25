@@ -15,6 +15,7 @@ from urllib.parse import urlencode
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import RedirectResponse
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session
 
 from app.config.settings import settings
@@ -59,12 +60,22 @@ def register(request: RegisterRequest, db: Session = Depends(get_session)):
             detail="An account with that email already exists.",
         )
 
-    user = create_user(
-        db,
-        email=request.email,
-        username=request.full_name,
-        password=request.password,
-    )
+    try:
+        user = create_user(
+            db,
+            email=request.email,
+            username=request.full_name,
+            password=request.password,
+        )
+    except IntegrityError:
+        # Unique constraint violation — most likely the display name (username)
+        # is already taken. Can also fire in a race condition where two requests
+        # with the same email slip through the get_user_by_email check above.
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="An account with that email or name already exists.",
+        )
 
     token = create_access_token(user.id)
     return AuthResponse(

@@ -11,6 +11,7 @@ Covered cases:
   3. Password 73 ASCII bytes                    → 422 (not 500)
   4. Password <=72 chars but >72 UTF-8 bytes    → 422 (byte check, not char check)
   5. Duplicate email                            → 409 (not confused with the above)
+  6. Duplicate display name (username collision) → 409 (not 500 from IntegrityError)
 
 Why byte length matters:
   bcrypt operates on bytes. len(password) counts Unicode characters, not bytes.
@@ -19,6 +20,7 @@ Why byte length matters:
 """
 
 from unittest.mock import patch
+from sqlalchemy.exc import IntegrityError
 
 from fastapi.testclient import TestClient
 
@@ -173,3 +175,25 @@ def test_register_duplicate_email_not_confused_with_password_error():
     # Must be 409, never 422 (which is for validation errors like bad password)
     assert response.status_code != 422
     assert response.status_code == 409
+
+
+# ---------------------------------------------------------------------------
+# Username collision — User.username is UNIQUE in DB, stored from full_name
+# ---------------------------------------------------------------------------
+
+def test_register_duplicate_display_name():
+    """
+    Two users with the same full_name would violate the users.username UNIQUE
+    constraint. The router must catch IntegrityError and return 409, never 500.
+    """
+    with (
+        patch("app.routers.auth.get_user_by_email", return_value=None),
+        patch(
+            "app.routers.auth.create_user",
+            side_effect=IntegrityError("duplicate key", {}, Exception()),
+        ),
+    ):
+        response = _register(_payload())
+
+    assert response.status_code == 409
+    assert response.status_code != 500
