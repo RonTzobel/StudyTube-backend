@@ -28,7 +28,6 @@ from pathlib import Path
 
 import boto3
 from botocore.exceptions import ClientError
-from fastapi import UploadFile
 
 from app.config.settings import settings
 
@@ -45,7 +44,7 @@ def _s3():
     )
 
 
-def upload_file_to_s3(file: UploadFile, user_id: int) -> str:
+def upload_file_to_s3(file: "UploadFile", user_id: int) -> str:
     """
     Stream-upload a video file to S3 and return the S3 key.
 
