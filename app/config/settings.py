@@ -88,7 +88,10 @@ class Settings(BaseSettings):
     # chunked transcription or moving to a larger instance.
     WHISPER_BEAM_SIZE: int = 1
     WHISPER_VAD_FILTER: bool = True
-    WHISPER_CPU_THREADS: int = 0
+    # cpu_threads=2: fixed thread count avoids the stall/hang that can occur
+    # when CTranslate2 auto-detects threads inside Docker on EC2 CPU instances.
+    # 0 (auto) sometimes causes inference to deadlock at near-zero CPU usage.
+    WHISPER_CPU_THREADS: int = 2
 
     # --- CORS ---
     # Default now includes production domains + local dev.
