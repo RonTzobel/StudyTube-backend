@@ -74,26 +74,15 @@ class Settings(BaseSettings):
     RAG_LOW_THRESHOLD: float = 0.30
     RAG_GOOD_THRESHOLD: float = 0.60
 
-    # --- Whisper transcription ---
-    # base.en: lightest stable model for CPU-only Docker/EC2 deployments.
-    # small.en stalls at near-zero CPU on constrained instances (CTranslate2
-    # thread scheduling issue even with cpu_threads=2). base.en is ~2× lighter
-    # and reliably completes inference. Upgrade to small.en or medium.en once
-    # the instance has more headroom or chunked streaming is implemented.
-    WHISPER_MODEL: str = "base.en"
-    WHISPER_LANGUAGE: str = "en"
-    WHISPER_DEVICE: str = "cpu"
-    WHISPER_COMPUTE_TYPE: str = "int8"
-    # beam_size=1: greedy decode — uses ~3× less RAM than beam_size=5 and
-    # avoids OOM kills on long videos. Raise back to 5 only after adding
-    # chunked transcription or moving to a larger instance.
-    WHISPER_BEAM_SIZE: int = 1
-    WHISPER_VAD_FILTER: bool = True
-    # cpu_threads=1: single-threaded inference — eliminates all OpenMP barrier
-    # and thread scheduling stalls that occur inside Docker on EC2 CPU instances.
-    # Slower than 2 threads but reliably completes. Raise only after confirming
-    # stable inference on this instance.
-    WHISPER_CPU_THREADS: int = 1
+    # --- External transcription (OpenAI Whisper API) ---
+    # Transcription is performed by the OpenAI Whisper API — no local model
+    # is loaded in the worker. OPENAI_API_KEY (above) is reused.
+    # Audio is split into 5-minute chunks before upload to stay within the
+    # 25 MB per-request API limit.
+    OPENAI_TRANSCRIPTION_MODEL: str = "whisper-1"
+    # Per-chunk HTTP timeout in seconds. 5-minute audio chunks typically
+    # complete in 10–30s; 300s gives ample headroom for slow API responses.
+    TRANSCRIPTION_TIMEOUT: int = 300
 
     # --- CORS ---
     # Default now includes production domains + local dev.
